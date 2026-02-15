@@ -1,4 +1,19 @@
-//! P2P networking layer for Bitevachat.
+//! Bitevachat libp2p network layer.
 //!
-//! Built on libp2p with QUIC transport, Kademlia DHT for peer discovery,
-//! gossipsub for metadata broadcast, and relay/hole-punching for NAT traversal.
+//! Provides peer identity management, transport configuration,
+//! DHT-based peer discovery, and swarm orchestration for the
+//! Bitevachat decentralized messaging protocol.
+//!
+//! # Architecture
+//!
+//! - [`identity`] — Convert wallet keypairs to libp2p identities
+//! - [`transport`] — QUIC + TCP transport with Noise encryption
+//! - [`discovery`] — Kademlia DHT + Identify behaviour
+//! - [`swarm`] — High-level swarm wrapper with event loop
+//! - [`config`] — Network configuration with defaults
+
+pub mod config;
+pub mod discovery;
+pub mod identity;
+pub mod swarm;
+pub mod transport;

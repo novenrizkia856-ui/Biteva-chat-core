@@ -301,26 +301,7 @@
 
 ---
 
-## Tahap 16: Group Chat — Symmetric Key & Membership
-
-**Tujuan:** Implementasi group chat v1 dengan group symmetric key, creator-managed membership, key rotation saat membership berubah, dan encrypted group messaging via gossipsub.
-
-**Deskripsi:** Group = group_id + group_symmetric_key + membership_list. Creator: generate group_id (random) + group_key, sign membership list, encrypt group_key ke setiap member (wrap dengan masing-masing member's X25519 pubkey). Member join: creator re-encrypt new group_key ke semua members. Member leave/remove: creator generate new group_key, re-distribute. Messages: encrypt dengan group_key via XChaCha20-Poly1305, broadcast via gossipsub topic `group/{group_id}`. Setiap group message tetap di-sign oleh sender untuk authenticity.
-
-**Yang dibuat:**
-
-- `crates/bitevachat-protocol/src/group.rs` — `GroupInfo` struct (group_id, creator, members, version), `SignedGroupInfo` (info + creator signature), `GroupKeyPackage` struct (group_id, encrypted_keys: HashMap<Address, EncryptedGroupKey>), `encrypt_group_key(group_key, member_pubkeys) -> GroupKeyPackage`, `decrypt_group_key(package, my_keypair) -> GroupKey`
-- `crates/bitevachat-protocol/src/group_message.rs` — `GroupMessage` struct (extends Message with group_id), `encrypt_group_message(group_key, sender_keypair, plaintext) -> GroupMessageEnvelope`, `decrypt_group_message(group_key, envelope) -> Plaintext`
-- `crates/bitevachat-node/src/group_manager.rs` — `GroupManager`, `create_group(name, members) -> GroupInfo`, `add_member(group_id, new_member)` (rotate key), `remove_member(group_id, member)` (rotate key), `send_group_message(group_id, plaintext)`, `on_group_message_received(envelope)`, `on_group_key_received(package)`
-- `crates/bitevachat-storage/src/groups.rs` — `GroupStore`, `save_group(info, key)`, `get_group(group_id)`, `list_groups()`, `save_group_messages(group_id, envelopes)`
-- `crates/bitevachat-network/src/gossip.rs` — tambah dynamic topic subscription per group (`group/{group_id}`), publish/receive group messages
-- `crates/bitevachat-node/tests/` — create group, member join/leave key rotation, group message encrypt/decrypt, unauthorized member rejection
-
-**File yang diubah:** `crates/bitevachat-node/src/event_loop.rs` (handle group events), `crates/bitevachat-rpc/proto/bitevachat.proto` (tambah GroupService RPCs), `crates/bitevachat-types/src/lib.rs` (tambah `GroupId` type)
-
----
-
-## Tahap 17: CLI Client
+## Tahap 16: CLI Client
 
 **Tujuan:** Membangun command-line client yang fully functional untuk testing, automation, dan power users — semua operasi bisa dilakukan via CLI.
 
@@ -334,7 +315,6 @@
 - `crates/bitevachat-cli/src/commands/wallet.rs` — `wallet create`, `wallet unlock`, `wallet lock`, `wallet address`, `wallet backup`, `wallet import`
 - `crates/bitevachat-cli/src/commands/message.rs` — `msg send <address> <text>`, `msg list [address]`, `msg get <msg_id>`, `msg pin <msg_id>`, `msg delete <msg_id>`
 - `crates/bitevachat-cli/src/commands/contact.rs` — `contact add <address> [alias]`, `contact list`, `contact block <address>`, `contact unblock <address>`
-- `crates/bitevachat-cli/src/commands/group.rs` — `group create <name> <member1> <member2>...`, `group list`, `group send <group_id> <text>`, `group add-member`, `group remove-member`
 - `crates/bitevachat-cli/src/commands/node.rs` — `node status`, `node peers`, `node config [set key value]`
 - `crates/bitevachat-cli/src/interactive.rs` — interactive chat REPL: select conversation → type messages → receive in real-time, `Ctrl+C` to exit
 - `crates/bitevachat-cli/src/rpc_client.rs` — gRPC client wrapper, connect to node's Unix socket/localhost
@@ -344,7 +324,7 @@
 
 ---
 
-## Tahap 18: Desktop GUI (egui + Tauri)
+## Tahap 17: Desktop GUI (egui + Tauri)
 
 **Tujuan:** Membangun desktop GUI yang user-friendly menggunakan egui (immediate-mode GUI), dengan optional Tauri packaging untuk cross-platform distribution.
 
@@ -369,25 +349,7 @@
 
 ---
 
-## Tahap 19: Metadata Privacy — Tor Integration & Relay Routing
-
-**Tujuan:** Mitigasi metadata leakage (IP, connection timing) dengan optional Tor integration, relay-based routing, dan connection obfuscation.
-
-**Deskripsi:** Tor: optional SOCKS5 proxy mode — route libp2p traffic via Tor (arti crate for Rust Tor client, atau external tor daemon via SOCKS5). Relay routing: multi-hop relay forwarding (pesan di-route melalui 2-3 relay nodes sebelum sampai recipient) — opt-in karena latency tradeoff. Connection obfuscation: randomized timing for gossipsub broadcasts (jitter ±random delay), padding dummy messages. Minimal telemetry enforcement: semua telemetry opt-in, anonymized (no PII).
-
-**Yang dibuat:**
-
-- `crates/bitevachat-network/src/tor.rs` — `TorTransport`, `configure_tor_socks5(proxy_addr: SocketAddr)`, wrap libp2p transport through SOCKS5, `TorMode` enum (Disabled, SocksProxy, EmbeddedArti)
-- `crates/bitevachat-network/src/onion_routing.rs` — `OnionRouter`, `route_via_relays(message, relay_chain: Vec<PeerId>) -> Result<()>`, multi-hop encryption (encrypt in layers: innermost = recipient, each layer = relay), relay node handler: unwrap one layer → forward
-- `crates/bitevachat-network/src/obfuscation.rs` — `TimingObfuscator`, `add_jitter(base_delay) -> Duration` (random ±30% delay), `DummyTrafficGenerator` (periodic dummy messages to cover real traffic patterns), `PaddingManager` (pad message sizes to fixed buckets)
-- `crates/bitevachat-node/src/telemetry.rs` — `TelemetryManager`, `opt_in(enabled: bool)`, `collect_metric(name, value)` (aggregated, non-PII), `export_metrics() -> AggregatedReport`
-- `crates/bitevachat-network/tests/` — Tor SOCKS5 connectivity test (mock), relay forwarding multi-hop test, timing jitter distribution test
-
-**File yang diubah:** `crates/bitevachat-network/src/swarm.rs` (integrate Tor transport option), `crates/bitevachat-network/src/config.rs` (privacy config: tor_enabled, relay_hops, jitter settings), `crates/bitevachat-gui/src/views/settings.rs` (privacy settings UI)
-
----
-
-## Tahap 20: Logging, Auditing, Testing & Production Hardening
+## Tahap 18: Logging, Auditing, Testing & Production Hardening
 
 **Tujuan:** Final hardening — encrypted logging, audit trail, comprehensive test suite (unit + integration + fuzz + adversarial), documentation, dan production configuration.
 

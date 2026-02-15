@@ -147,6 +147,38 @@ impl Keypair {
         let sig = self.signing_key.sign(message);
         Signature(sig.to_bytes())
     }
+
+    // ------------------------------------------------------------------
+    // ADDED FOR TAHAP 9 — libp2p identity conversion
+    // ------------------------------------------------------------------
+
+    /// Returns the 32-byte seed (secret scalar) of this keypair.
+    ///
+    /// This is the minimal secret material needed to reconstruct the
+    /// full Ed25519 keypair deterministically. Used by the network
+    /// layer to convert a wallet identity into a libp2p peer identity.
+    ///
+    /// # Security
+    ///
+    /// The returned bytes are sensitive key material. Callers **must**
+    /// zeroize or discard the copy as soon as it is no longer needed.
+    pub fn seed_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
+    /// Returns the full 64-byte keypair encoding (seed ‖ public key).
+    ///
+    /// Format: 32-byte secret scalar followed by 32-byte compressed
+    /// public point. This matches the `ed25519-dalek` canonical
+    /// encoding and is accepted by `libp2p::identity::ed25519::Keypair::try_from_bytes`.
+    ///
+    /// # Security
+    ///
+    /// The returned bytes contain the private key. Callers **must**
+    /// zeroize or discard the copy as soon as it is no longer needed.
+    pub fn to_keypair_bytes(&self) -> [u8; 64] {
+        self.signing_key.to_keypair_bytes()
+    }
 }
 
 // Keypair intentionally does not implement Clone or Debug to prevent
@@ -238,5 +270,31 @@ mod tests {
         let addr1 = pubkey_to_address(&kp.public_key());
         let addr2 = pubkey_to_address(&kp.public_key());
         assert_eq!(addr1, addr2);
+    }
+
+    #[test]
+    fn seed_bytes_roundtrip() {
+        let seed = [0x42u8; 32];
+        let kp = Keypair::from_seed(&seed);
+        assert_eq!(kp.seed_bytes(), seed);
+    }
+
+    #[test]
+    fn to_keypair_bytes_deterministic() {
+        let seed = [0x42u8; 32];
+        let kp1 = Keypair::from_seed(&seed);
+        let kp2 = Keypair::from_seed(&seed);
+        assert_eq!(kp1.to_keypair_bytes(), kp2.to_keypair_bytes());
+    }
+
+    #[test]
+    fn to_keypair_bytes_contains_seed_and_pubkey() {
+        let seed = [0x42u8; 32];
+        let kp = Keypair::from_seed(&seed);
+        let full = kp.to_keypair_bytes();
+        // First 32 bytes = seed
+        assert_eq!(&full[..32], &seed);
+        // Last 32 bytes = public key
+        assert_eq!(&full[32..], kp.public_key().as_bytes());
     }
 }

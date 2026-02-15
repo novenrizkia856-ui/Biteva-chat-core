@@ -4,9 +4,37 @@ edition.workspace = true
 version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "P2P networking: libp2p transport, Kademlia DHT, gossipsub, NAT traversal"
+description = "libp2p network layer for Bitevachat: identity, transport, discovery, swarm"
 
 [dependencies]
-bitevachat-types = { path = "../bitevachat-types" }
+# --- libp2p: only features actually used in this crate ---
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "tcp",
+    "quic",
+    "noise",
+    "yamux",
+    "kad",
+    "identify",
+    "macros",
+] }
+
+# --- Bitevachat workspace crates ---
 bitevachat-crypto = { path = "../bitevachat-crypto" }
-bitevachat-protocol = { path = "../bitevachat-protocol" }
+bitevachat-types  = { path = "../bitevachat-types" }
+
+# --- Async runtime (minimal features) ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+# --- Stream combinators for Swarm event loop ---
+futures = "0.3"
+
+# --- Structured logging ---
+tracing = "0.1"
+
+# --- Serialization for NetworkConfig ---
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
