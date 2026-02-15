@@ -11,6 +11,7 @@
 //! - [`hash`] — SHA3-256 hashing and message ID computation
 //! - [`kdf`] — Argon2id key derivation for wallet encryption
 //! - [`hkdf`] — HKDF-SHA256 key derivation for session keys
+//! - [`mac`] — HMAC-SHA256 message authentication codes
 //! - [`checksum`] — Address checksum and Bech32 encoding
 //! - [`mnemonic`] — BIP39 mnemonic generation, validation, and seed derivation
 //! - [`hd_derive`] — SLIP-0010 Ed25519 hierarchical deterministic key derivation
@@ -23,6 +24,7 @@ pub mod hash;
 pub mod hd_derive;
 pub mod hkdf;
 pub mod kdf;
+pub mod mac;
 pub mod mnemonic;
 pub mod signing;
 pub mod wordlist;
