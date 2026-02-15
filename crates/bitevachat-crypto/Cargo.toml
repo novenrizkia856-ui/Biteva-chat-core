@@ -10,12 +10,14 @@ description = "Cryptographic primitives for Bitevachat: Ed25519, X25519, XChaCha
 bitevachat-types = { path = "../bitevachat-types" }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize", "rand_core"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+curve25519-dalek = { version = "4", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["std"] }
 sha3 = { version = "0.10", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 argon2 = { version = "0.5", default-features = false, features = ["std"] }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 zeroize = { version = "1", features = ["derive"] }
+hkdf = "0.12"
 hmac = "0.12"
 pbkdf2 = "0.12"
 bech32 = "0.9"

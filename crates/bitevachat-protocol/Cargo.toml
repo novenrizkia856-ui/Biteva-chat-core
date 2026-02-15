@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Message protocol: canonical CBOR serialization, signing, validation, replay protection"
+description = "Message protocol: canonical CBOR serialization, signing, validation, replay protection, E2E encryption"
 
 [dependencies]
 bitevachat-types = { path = "../bitevachat-types" }
@@ -12,3 +12,4 @@ bitevachat-crypto = { path = "../bitevachat-crypto" }
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
 chrono = "0.4"
+zeroize = { version = "1", features = ["derive"] }

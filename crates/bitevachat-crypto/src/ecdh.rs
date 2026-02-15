@@ -196,6 +196,44 @@ pub fn ed25519_pubkey_to_x25519(
     Ok(pk)
 }
 
+/// Converts Ed25519 public key **bytes** to an X25519 public key.
+///
+/// Unlike [`ed25519_pubkey_to_x25519`] which requires the full
+/// keypair (private key path), this function performs a direct
+/// birational map from the twisted Edwards curve to the Montgomery
+/// curve:
+///
+/// 1. Decompress the 32-byte compressed Edwards Y point.
+/// 2. Convert the Edwards point to Montgomery form.
+/// 3. Return the 32-byte X25519 public key.
+///
+/// This is essential for E2E encryption where the sender only knows
+/// the recipient's Ed25519 verifying key and has no access to the
+/// recipient's private key.
+///
+/// # Note
+///
+/// The output may differ from [`ed25519_pubkey_to_x25519`] for the
+/// same Ed25519 key because that function derives through the
+/// secret-key SHA-512 path. Both produce valid X25519 keys, but
+/// callers must be consistent: use *this* function for public-key-only
+/// conversion and [`ed25519_to_x25519`] when the keypair is available.
+///
+/// # Errors
+///
+/// Returns [`BitevachatError::CryptoError`] if the bytes do not
+/// represent a valid compressed Edwards point.
+pub fn ed25519_pubkey_bytes_to_x25519(
+    ed_pubkey: &[u8; 32],
+) -> Result<X25519PublicKey> {
+    let compressed = curve25519_dalek::edwards::CompressedEdwardsY(*ed_pubkey);
+    let point = compressed.decompress().ok_or_else(|| BitevachatError::CryptoError {
+        reason: "Ed25519 public key decompression failed: invalid curve point".into(),
+    })?;
+    let montgomery = point.to_montgomery();
+    Ok(X25519PublicKey::from_bytes(montgomery.to_bytes()))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -265,5 +303,27 @@ mod tests {
         let shared_ac = ecdh_derive_shared_ephemeral(a, &pub_c);
         let shared_bc = ecdh_derive_shared_ephemeral(b, &pub_c);
         assert_ne!(shared_ac.as_bytes(), shared_bc.as_bytes());
+    }
+
+    #[test]
+    fn ed25519_pubkey_bytes_to_x25519_is_deterministic() -> std::result::Result<(), BitevachatError> {
+        let kp = Keypair::from_seed(&[0x55u8; 32]);
+        let pubkey_bytes = kp.public_key();
+
+        let x1 = ed25519_pubkey_bytes_to_x25519(pubkey_bytes.as_bytes())?;
+        let x2 = ed25519_pubkey_bytes_to_x25519(pubkey_bytes.as_bytes())?;
+        assert_eq!(x1.as_bytes(), x2.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn ed25519_pubkey_bytes_to_x25519_different_keys_differ() -> std::result::Result<(), BitevachatError> {
+        let kp1 = Keypair::from_seed(&[0x55u8; 32]);
+        let kp2 = Keypair::from_seed(&[0x66u8; 32]);
+
+        let x1 = ed25519_pubkey_bytes_to_x25519(kp1.public_key().as_bytes())?;
+        let x2 = ed25519_pubkey_bytes_to_x25519(kp2.public_key().as_bytes())?;
+        assert_ne!(x1.as_bytes(), x2.as_bytes());
+        Ok(())
     }
 }
