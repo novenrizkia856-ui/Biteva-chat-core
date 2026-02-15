@@ -1,0 +1,16 @@
+[package]
+name = "bitevachat-types"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core shared types for the Bitevachat decentralized chat system"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bitevachat-types",
+    "crates/bitevachat-crypto",
+    "crates/bitevachat-wallet",
+    "crates/bitevachat-storage",
+    "crates/bitevachat-protocol",
+    "crates/bitevachat-network",
+    "crates/bitevachat-rpc",
+    "crates/bitevachat-node",
+    "crates/bitevachat-cli",
+    "crates/bitevachat-gui",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+authors = ["Bitevachat Contributors"]
+license = "MIT"
+
+[profile.release]
+lto = true
+opt-level = "z"
+strip = "symbols"
+codegen-units = 1

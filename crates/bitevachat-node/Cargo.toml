@@ -1,0 +1,20 @@
+[package]
+name = "bitevachat-node"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Bitevachat node runtime: event loop, component orchestration"
+
+[[bin]]
+name = "bitevachat-node"
+path = "src/main.rs"
+
+[dependencies]
+bitevachat-types = { path = "../bitevachat-types" }
+bitevachat-crypto = { path = "../bitevachat-crypto" }
+bitevachat-wallet = { path = "../bitevachat-wallet" }
+bitevachat-protocol = { path = "../bitevachat-protocol" }
+bitevachat-storage = { path = "../bitevachat-storage" }
+bitevachat-network = { path = "../bitevachat-network" }
+bitevachat-rpc = { path = "../bitevachat-rpc" }

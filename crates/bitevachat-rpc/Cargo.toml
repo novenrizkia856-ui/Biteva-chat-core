@@ -1,0 +1,10 @@
+[package]
+name = "bitevachat-rpc"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Local gRPC server for UI and external integration"
+
+[dependencies]
+bitevachat-types = { path = "../bitevachat-types" }

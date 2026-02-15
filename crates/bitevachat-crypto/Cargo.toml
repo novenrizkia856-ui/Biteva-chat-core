@@ -1,0 +1,10 @@
+[package]
+name = "bitevachat-crypto"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Cryptographic primitives for Bitevachat: Ed25519, X25519, XChaCha20-Poly1305, SHA3-256, Argon2id, BIP39"
+
+[dependencies]
+bitevachat-types = { path = "../bitevachat-types" }

@@ -1,0 +1,12 @@
+[package]
+name = "bitevachat-storage"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Encrypted storage engine: message store, conversation index, pending queue"
+
+[dependencies]
+bitevachat-types = { path = "../bitevachat-types" }
+bitevachat-crypto = { path = "../bitevachat-crypto" }
+bitevachat-protocol = { path = "../bitevachat-protocol" }

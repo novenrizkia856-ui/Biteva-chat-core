@@ -1,0 +1,10 @@
+[build]
+# Incremental compilation for dev builds
+incremental = true
+
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+# LTO and codegen-units are set in workspace Cargo.toml
+# Additional target-specific flags can be added here

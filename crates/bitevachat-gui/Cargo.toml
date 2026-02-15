@@ -1,0 +1,15 @@
+[package]
+name = "bitevachat-gui"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Desktop GUI for Bitevachat (egui + optional Tauri)"
+
+[[bin]]
+name = "bitevachat-gui"
+path = "src/main.rs"
+
+[dependencies]
+bitevachat-types = { path = "../bitevachat-types" }
+bitevachat-rpc = { path = "../bitevachat-rpc" }
