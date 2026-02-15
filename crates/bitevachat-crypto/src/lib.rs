@@ -1,13 +1,20 @@
 //! Cryptographic primitives for the Bitevachat decentralized chat system.
 //!
-//! This crate is the **sole** location for all cryptographic operations:
+//! This crate is the **sole** location for all cryptographic operations.
+//! No other crate in the workspace may perform raw crypto directly.
 //!
-//! - **Ed25519** signing and verification
-//! - **X25519** ECDH key agreement
-//! - **XChaCha20-Poly1305** AEAD encryption/decryption
-//! - **SHA3-256** hashing and message ID computation
-//! - **Argon2id** key derivation for wallet encryption
-//! - **BIP39** mnemonic generation and seed derivation
-//! - **HKDF-SHA256** for session key derivation
+//! # Modules
 //!
-//! No other crate in the workspace should perform raw crypto operations.
+//! - [`signing`] — Ed25519 keypair generation, signing, and verification
+//! - [`ecdh`] — X25519 Elliptic-Curve Diffie-Hellman key agreement
+//! - [`aead`] — XChaCha20-Poly1305 authenticated encryption/decryption
+//! - [`hash`] — SHA3-256 hashing and message ID computation
+//! - [`kdf`] — Argon2id key derivation for wallet encryption
+//! - [`checksum`] — Address checksum and Bech32 encoding
+
+pub mod aead;
+pub mod checksum;
+pub mod ecdh;
+pub mod hash;
+pub mod kdf;
+pub mod signing;

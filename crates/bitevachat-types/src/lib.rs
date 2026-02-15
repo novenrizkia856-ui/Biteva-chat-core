@@ -541,6 +541,35 @@ pub enum BitevachatError {
 }
 
 // ---------------------------------------------------------------------------
+// Signable / Verifiable traits
+// ---------------------------------------------------------------------------
+
+/// Trait for types that can produce canonical bytes for Ed25519 signing.
+///
+/// Implementors define how their data is serialized into a byte sequence
+/// that will be signed. The crypto crate performs the actual signing;
+/// this trait lives in `bitevachat-types` so both the protocol and
+/// crypto crates can reference it without circular dependencies.
+pub trait Signable {
+    /// Returns the canonical byte representation to be signed.
+    fn signable_bytes(&self) -> Vec<u8>;
+}
+
+/// Trait for types that carry an embedded signature and can be verified.
+///
+/// Implementors provide access to the signed bytes, the signature, and
+/// the signer's address. The crypto crate performs the actual
+/// verification.
+pub trait Verifiable {
+    /// Returns the canonical bytes that were signed.
+    fn signed_bytes(&self) -> Vec<u8>;
+    /// Returns the raw 64-byte Ed25519 signature.
+    fn signature_bytes(&self) -> &[u8];
+    /// Returns the address (public key hash) of the signer.
+    fn signer_address(&self) -> &Address;
+}
+
+// ---------------------------------------------------------------------------
 // Result alias
 // ---------------------------------------------------------------------------
 
@@ -556,12 +585,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn address_roundtrip_hex() {
+    fn address_roundtrip_hex() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let bytes = [0xABu8; 32];
         let addr = Address::new(bytes);
         let hex_str = addr.to_string();
-        let parsed: Address = hex_str.parse().expect("valid hex address");
+        let parsed: Address = hex_str.parse()?;
         assert_eq!(addr, parsed);
+        Ok(())
     }
 
     #[test]
@@ -577,29 +607,32 @@ mod tests {
     }
 
     #[test]
-    fn message_id_roundtrip_hex() {
+    fn message_id_roundtrip_hex() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let bytes = [0x42u8; 32];
         let mid = MessageId::new(bytes);
         let hex_str = mid.to_string();
-        let parsed: MessageId = hex_str.parse().expect("valid hex message id");
+        let parsed: MessageId = hex_str.parse()?;
         assert_eq!(mid, parsed);
+        Ok(())
     }
 
     #[test]
-    fn node_id_roundtrip_hex() {
+    fn node_id_roundtrip_hex() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let bytes = [0x01u8; 32];
         let nid = NodeId::new(bytes);
         let hex_str = nid.to_string();
-        let parsed: NodeId = hex_str.parse().expect("valid hex node id");
+        let parsed: NodeId = hex_str.parse()?;
         assert_eq!(nid, parsed);
+        Ok(())
     }
 
     #[test]
-    fn timestamp_now_parses_back() {
+    fn timestamp_now_parses_back() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let ts = Timestamp::now();
         let s = ts.as_str();
-        let parsed: Timestamp = s.parse().expect("valid rfc3339");
+        let parsed: Timestamp = s.parse()?;
         assert_eq!(ts.as_datetime(), parsed.as_datetime());
+        Ok(())
     }
 
     #[test]
@@ -631,11 +664,12 @@ mod tests {
     }
 
     #[test]
-    fn address_serde_json_roundtrip() {
+    fn address_serde_json_roundtrip() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let addr = Address::new([0x11u8; 32]);
-        let json = serde_json::to_string(&addr).expect("serialize");
-        let parsed: Address = serde_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string(&addr)?;
+        let parsed: Address = serde_json::from_str(&json)?;
         assert_eq!(addr, parsed);
+        Ok(())
     }
 
     #[test]

@@ -150,14 +150,15 @@ mod tests {
     }
 
     #[test]
-    fn config_serde_roundtrip() {
+    fn config_serde_roundtrip() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let config = AppConfig::default();
-        let json = serde_json::to_string(&config).expect("serialize config");
-        let parsed: AppConfig = serde_json::from_str(&json).expect("deserialize config");
+        let json = serde_json::to_string(&config)?;
+        let parsed: AppConfig = serde_json::from_str(&json)?;
         assert_eq!(config.pending_ttl_days, parsed.pending_ttl_days);
         assert_eq!(config.db_retention_messages, parsed.db_retention_messages);
         assert_eq!(config.rate_limit_per_min, parsed.rate_limit_per_min);
         assert_eq!(config.pending_max, parsed.pending_max);
         assert_eq!(config.nonce_cache_size, parsed.nonce_cache_size);
+        Ok(())
     }
 }
