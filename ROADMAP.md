@@ -80,7 +80,7 @@
 - `crates/bitevachat-wallet/src/rotation.rs` — `rotate_key(old_wallet, new_mnemonic) -> (NewWallet, MigrationStatement)`, `MigrationStatement` struct (old_address, new_address, timestamp, signature_by_old_key)
 - `crates/bitevachat-wallet/tests/` — test create/lock/unlock cycle, backup/restore round-trip, invalid passphrase rejection, wallet file corruption detection
 
-**File yang diubah:** Workspace `Cargo.toml` (sudah ada member), `crates/bitevachat-types/src/lib.rs` (tambah `WalletStatus` enum jika diperlukan)
+**File yang diubah:**, `crates/bitevachat-types/src/lib.rs` (tambah `WalletStatus` enum jika diperlukan)
 
 ---
 
