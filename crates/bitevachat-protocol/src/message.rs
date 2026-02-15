@@ -54,6 +54,7 @@ pub struct Message {
 /// [`crate::canonical::to_canonical_cbor`], ensuring that any
 /// modification to the message (including field reordering) is
 /// detectable.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageEnvelope {
     /// The signed message.
     pub message: Message,

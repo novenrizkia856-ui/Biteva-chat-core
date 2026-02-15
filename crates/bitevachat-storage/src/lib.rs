@@ -11,3 +11,5 @@ pub mod messages;
 pub mod conversations;
 pub mod contacts;
 pub mod settings;
+pub mod pending;
+pub mod pending_file;

@@ -47,6 +47,47 @@ impl PublicKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Signature([u8; 64]);
 
+impl serde::Serialize for Signature {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Signature {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct SigVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SigVisitor {
+            type Value = Signature;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("64 bytes for Ed25519 signature")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> std::result::Result<Signature, E> {
+                if v.len() != 64 {
+                    return Err(E::invalid_length(v.len(), &"64"));
+                }
+                let mut arr = [0u8; 64];
+                arr.copy_from_slice(v);
+                Ok(Signature(arr))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Signature, A::Error> {
+                let mut arr = [0u8; 64];
+                for (i, byte) in arr.iter_mut().enumerate() {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &"64"))?;
+                }
+                Ok(Signature(arr))
+            }
+        }
+
+        deserializer.deserialize_bytes(SigVisitor)
+    }
+}
+
 impl Signature {
     /// Fixed byte length of an Ed25519 signature.
     pub const LEN: usize = 64;

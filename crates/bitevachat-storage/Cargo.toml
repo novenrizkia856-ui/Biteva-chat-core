@@ -9,6 +9,7 @@ description = "Encrypted storage engine: message store, conversation index, pend
 [dependencies]
 bitevachat-types = { path = "../bitevachat-types" }
 bitevachat-crypto = { path = "../bitevachat-crypto" }
+bitevachat-protocol = { path = "../bitevachat-protocol" }
 
 sled = "0.34"
 serde = { version = "1", features = ["derive"] }

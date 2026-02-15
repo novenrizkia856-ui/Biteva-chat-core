@@ -18,3 +18,5 @@ bitevachat-protocol = { path = "../bitevachat-protocol" }
 bitevachat-storage = { path = "../bitevachat-storage" }
 bitevachat-network = { path = "../bitevachat-network" }
 bitevachat-rpc = { path = "../bitevachat-rpc" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
