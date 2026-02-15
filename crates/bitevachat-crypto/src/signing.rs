@@ -5,7 +5,7 @@
 //! zeroized on drop via `ed25519-dalek`'s built-in `ZeroizeOnDrop`.
 
 use bitevachat_types::{Address, BitevachatError, Result};
-use ed25519_dalek::{Signer, Verifier, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 
 use crate::hash::sha3_256;
