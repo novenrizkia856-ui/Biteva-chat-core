@@ -54,6 +54,15 @@ impl<'a> ContactStore<'a> {
         }
     }
 
+    /// Returns the full contact record for an address, if it exists.
+    ///
+    /// Returns `Ok(None)` if the address has never been added as a
+    /// contact. Returns `Ok(Some(record))` if any contact data
+    /// (alias or block status) has been stored for this address.
+    pub fn get_contact(&self, address: &Address) -> Result<Option<ContactRecord>> {
+        self.tree.get(address.as_bytes())
+    }
+
     /// Blocks a contact.
     pub fn block(&self, address: &Address) -> Result<()> {
         let mut record = self.get_or_default(address)?;

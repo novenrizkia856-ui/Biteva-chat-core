@@ -66,6 +66,19 @@ pub struct NetworkConfig {
     pub kad_query_timeout_secs: u64,
 
     // -----------------------------------------------------------------------
+    // Local discovery
+    // -----------------------------------------------------------------------
+
+    /// Enable mDNS for automatic peer discovery on the local network.
+    ///
+    /// When enabled, the node broadcasts its presence via multicast
+    /// DNS and automatically connects to other Bitevachat nodes on
+    /// the same LAN. Essential for local P2P testing.
+    ///
+    /// Default: `true`.
+    pub enable_mdns: bool,
+
+    // -----------------------------------------------------------------------
     // NAT traversal
     // -----------------------------------------------------------------------
 
@@ -151,6 +164,8 @@ impl Default for NetworkConfig {
             kad_protocol: "/bitevachat/kad/1.0.0".into(),
             kad_replication_factor: 20,
             kad_query_timeout_secs: 30,
+            // Local discovery
+            enable_mdns: true,
             // NAT traversal defaults
             enable_autonat: true,
             autonat_confidence_max: 3,

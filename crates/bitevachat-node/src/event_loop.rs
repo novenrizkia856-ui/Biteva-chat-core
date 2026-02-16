@@ -24,7 +24,6 @@ use crate::incoming;
 use crate::maintenance;
 use crate::node::{NodeRuntime, NodeState};
 use crate::outgoing;
-use crate::pending_scheduler::PendingScheduler;
 
 // ---------------------------------------------------------------------------
 // Helper: PeerId -> NodeId
@@ -53,11 +52,6 @@ fn peer_id_to_node_id(peer_id: &libp2p::PeerId) -> NodeId {
 pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
     tracing::info!("node event loop started");
 
-    let scheduler = PendingScheduler::new(
-        rt.pending_queue.clone(),
-        rt.pending_tick_secs,
-    );
-
     let mut pending_tick = tokio::time::interval(
         Duration::from_secs(rt.pending_tick_secs),
     );
@@ -68,6 +62,21 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
     // Start listening on the configured address.
     if let Err(e) = rt.network.start_listening(rt.listen_addr.clone()) {
         tracing::error!(%e, "failed to start listening -- continuing without listener");
+    }
+
+    // Publish our Address→PeerId mapping to the DHT so other
+    // nodes can find us.  This may fail if no peers are known yet
+    // (the mDNS or bootstrap process will add them later and we
+    // re-publish in the maintenance tick).
+    {
+        let my_address = bitevachat_crypto::signing::pubkey_to_address(
+            &bitevachat_crypto::signing::PublicKey::from_bytes(*rt.wallet.public_key()),
+        );
+        let my_peer_id = *rt.network.local_peer_id();
+        match rt.network.publish_address(&my_address, &my_peer_id) {
+            Ok(_qid) => tracing::info!(%my_address, "published address to DHT"),
+            Err(e) => tracing::debug!(%e, "DHT publish deferred (no peers yet)"),
+        }
     }
 
     loop {
@@ -109,7 +118,7 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
             // 4. Pending message retry tick.
             // ---------------------------------------------------------------
             _ = pending_tick.tick() => {
-                handle_pending_tick(&scheduler, &rt.pending_queue);
+                handle_pending_tick(&mut rt);
             }
 
             // ---------------------------------------------------------------
@@ -117,6 +126,13 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
             // ---------------------------------------------------------------
             _ = maintenance_tick.tick() => {
                 handle_maintenance_tick(&rt.storage, &rt.config);
+
+                // Re-publish our Address→PeerId in the DHT periodically.
+                let my_address = bitevachat_crypto::signing::pubkey_to_address(
+                    &bitevachat_crypto::signing::PublicKey::from_bytes(*rt.wallet.public_key()),
+                );
+                let my_peer_id = *rt.network.local_peer_id();
+                let _ = rt.network.publish_address(&my_address, &my_peer_id);
             }
 
             // ---------------------------------------------------------------
@@ -314,7 +330,7 @@ fn handle_command(
         }
 
         NodeCommand::ListMessages { convo_id, limit, offset, reply } => {
-            let result = handle_list_messages(&rt.storage, convo_id, limit, offset);
+            let result = handle_list_messages(rt, convo_id, limit, offset);
             let _ = reply.send(result);
             false
         }
@@ -368,33 +384,40 @@ fn handle_command(
         }
 
         NodeCommand::UpdateProfile { name, bio, avatar_bytes, reply } => {
-            let mapped = match rt.wallet.get_keypair() {
-                Ok(keypair) => {
-                    let result = rt.profile_manager.update_profile(
-                        keypair,
-                        name,
-                        bio,
-                        avatar_bytes.as_deref(),
-                        &rt.storage,
-                    );
-                    result.map(|_cbor_bytes| {
-                        let address = bitevachat_crypto::signing::pubkey_to_address(
-                            &keypair.public_key(),
-                        );
-                        let (cid_str, version) = rt.profile_manager
-                            .get_profile(&address)
-                            .map(|signed| {
-                                let cid = signed.profile.avatar_cid
-                                    .map(|c| c.to_string())
-                                    .unwrap_or_default();
-                                (cid, signed.profile.version)
-                            })
-                            .unwrap_or_else(|| (String::new(), 1));
-                        (cid_str, version)
-                    })
+            let kp = match rt.wallet.get_keypair() {
+                Ok(k) => k,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return false;
                 }
-                Err(e) => Err(e),
             };
+            let result = rt.profile_manager.update_profile(
+                kp,
+                name,
+                bio,
+                avatar_bytes.as_deref(),
+                &rt.storage,
+            );
+            // Map Result<Vec<u8>> to Result<(String, u64)>:
+            // On success we return (avatar_cid_hex, new_version).
+            let mapped = result.map(|_cbor_bytes| {
+                // Re-read the just-updated profile to get cid + version.
+                let address = bitevachat_crypto::signing::pubkey_to_address(
+                    &bitevachat_crypto::signing::PublicKey::from_bytes(
+                        *rt.wallet.public_key(),
+                    ),
+                );
+                let (cid_str, version) = rt.profile_manager
+                    .get_profile(&address)
+                    .map(|signed| {
+                        let cid = signed.profile.avatar_cid
+                            .map(|c| c.to_string())
+                            .unwrap_or_default();
+                        (cid, signed.profile.version)
+                    })
+                    .unwrap_or_else(|| (String::new(), 1));
+                (cid_str, version)
+            });
             let _ = reply.send(mapped);
             false
         }
@@ -412,7 +435,7 @@ fn handle_command(
     }
 }
 
-/// Handles the SendMessage command: build envelope -> enqueue pending.
+/// Handles the SendMessage command: build envelope → store locally → enqueue pending.
 fn handle_send_message(
     rt: &mut NodeRuntime,
     recipient: bitevachat_types::Address,
@@ -429,6 +452,39 @@ fn handle_send_message(
         rt.node_id,
     )?;
 
+    // --- 1. Store outgoing message in the local message database --------
+    let sender_addr = bitevachat_crypto::signing::pubkey_to_address(
+        &bitevachat_crypto::signing::PublicKey::from_bytes(*rt.wallet.public_key()),
+    );
+    let convo_id = incoming::compute_convo_id(&sender_addr, &recipient);
+
+    let type_byte = match payload_type {
+        bitevachat_types::PayloadType::Text => 0u8,
+        bitevachat_types::PayloadType::File => 1u8,
+        bitevachat_types::PayloadType::System => 2u8,
+    };
+
+    let stored = bitevachat_storage::messages::StoredMessage {
+        sender: *sender_addr.as_bytes(),
+        recipient: *recipient.as_bytes(),
+        message_id: *message_id.as_bytes(),
+        convo_id: *convo_id.as_bytes(),
+        timestamp_millis: envelope.message.timestamp.as_datetime().timestamp_millis(),
+        payload_type: type_byte,
+        // Store PLAINTEXT for local display; encryption is for the wire only.
+        payload_ciphertext: plaintext.to_vec(),
+        nonce: *envelope.message.nonce.as_bytes(),
+        signature: envelope.signature.as_bytes().to_vec(),
+    };
+
+    if let Err(e) = rt.storage.messages().and_then(|ms| ms.store_message(&stored)) {
+        tracing::warn!(%e, %message_id, "failed to store outgoing message locally");
+        // Continue — delivery is more important than local persistence.
+    } else {
+        tracing::debug!(%message_id, "outgoing message stored locally");
+    }
+
+    // --- 2. Enqueue for pending delivery --------------------------------
     let pending_entry = bitevachat_storage::pending::PendingEntry {
         envelope: envelope.clone(),
         retry_count: 0,
@@ -444,8 +500,29 @@ fn handle_send_message(
 
     tracing::info!(
         %message_id,
-        "message enqueued for delivery"
+        "message stored and enqueued for delivery"
     );
+
+    // --- 3. Attempt direct delivery if peer is known + connected -------
+    match rt.network.try_deliver_to_address(
+        &recipient,
+        envelope,
+        message_id,
+    ) {
+        Ok(()) => {
+            tracing::info!(%message_id, %recipient, "direct delivery dispatched");
+        }
+        Err(e) => {
+            // Not fatal: message is in the pending queue and will be
+            // retried on the next tick once the peer is discovered.
+            tracing::debug!(
+                %message_id,
+                %recipient,
+                %e,
+                "direct delivery not possible, will retry from pending queue"
+            );
+        }
+    }
 
     Ok(message_id)
 }
@@ -479,55 +556,135 @@ fn build_status(rt: &NodeRuntime) -> NodeStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Message query handlers (stubs)
+// Message query handlers
 // ---------------------------------------------------------------------------
 
+/// Lists messages for a conversation.
+///
+/// The `convo_id` from the GUI is the **peer address** (not the
+/// hashed conversation ID). We recompute the real ConvoId using
+/// `compute_convo_id(my_address, peer_address)` to match what
+/// both `handle_send_message` and `incoming::store_envelope` use.
 fn handle_list_messages(
-    _storage: &bitevachat_storage::engine::StorageEngine,
-    _convo_id: bitevachat_types::ConvoId,
-    _limit: u64,
-    _offset: u64,
+    rt: &NodeRuntime,
+    convo_id: bitevachat_types::ConvoId,
+    limit: u64,
+    offset: u64,
 ) -> std::result::Result<Vec<MessageInfo>, BitevachatError> {
-    tracing::debug!("ListMessages: stub -- returning empty");
-    Ok(Vec::new())
+    let my_address = bitevachat_crypto::signing::pubkey_to_address(
+        &bitevachat_crypto::signing::PublicKey::from_bytes(*rt.wallet.public_key()),
+    );
+
+    // The GUI sends the peer address bytes wrapped as ConvoId.
+    // Recompute the real SHA3 convo ID from (my_address, peer_address).
+    let peer_address = bitevachat_types::Address::new(*convo_id.as_bytes());
+    let real_convo_id = incoming::compute_convo_id(&my_address, &peer_address);
+
+    let msg_store = rt.storage.messages()?;
+    let stored_messages = msg_store.get_messages(
+        &real_convo_id,
+        limit as usize,
+        offset as usize,
+    )?;
+
+    tracing::debug!(
+        count = stored_messages.len(),
+        limit,
+        offset,
+        "ListMessages: returning {} messages",
+        stored_messages.len(),
+    );
+
+    let results: Vec<MessageInfo> = stored_messages
+        .into_iter()
+        .map(|sm| {
+            let pt = match sm.payload_type {
+                0 => bitevachat_types::PayloadType::Text,
+                1 => bitevachat_types::PayloadType::File,
+                _ => bitevachat_types::PayloadType::System,
+            };
+
+            let dt = chrono::DateTime::from_timestamp_millis(sm.timestamp_millis)
+                .unwrap_or_else(|| chrono::Utc::now());
+            let ts = Timestamp::from_datetime(dt);
+
+            MessageInfo {
+                message_id: MessageId::new(sm.message_id),
+                sender: bitevachat_types::Address::new(sm.sender),
+                recipient: bitevachat_types::Address::new(sm.recipient),
+                timestamp: ts,
+                payload_type: pt,
+                payload_ciphertext: sm.payload_ciphertext,
+            }
+        })
+        .collect();
+
+    Ok(results)
 }
 
 fn handle_get_message(
     _storage: &bitevachat_storage::engine::StorageEngine,
-    _message_id: MessageId,
+    message_id: MessageId,
 ) -> std::result::Result<Option<MessageInfo>, BitevachatError> {
-    tracing::debug!("GetMessage: stub -- returning None");
+    // Single-message lookup is not yet supported by the current
+    // MessageStore API (it uses prefix scans). Log and return None.
+    tracing::debug!(%message_id, "GetMessage: single-key lookup not yet implemented");
     Ok(None)
 }
 
 // ---------------------------------------------------------------------------
-// Contact handlers (stubs)
+// Contact handlers
 // ---------------------------------------------------------------------------
 
 fn handle_add_contact(
-    _storage: &bitevachat_storage::engine::StorageEngine,
+    storage: &bitevachat_storage::engine::StorageEngine,
     address: bitevachat_types::Address,
     alias: &str,
 ) -> std::result::Result<(), BitevachatError> {
-    tracing::debug!(%address, alias, "AddContact: stub -- not persisted");
+    let contact_store = storage.contacts()?;
+    let alias_opt = if alias.is_empty() {
+        None
+    } else {
+        Some(alias.to_string())
+    };
+    contact_store.set_alias(&address, alias_opt)?;
+    tracing::info!(%address, alias, "contact added/updated");
     Ok(())
 }
 
 fn handle_block_contact(
-    _storage: &bitevachat_storage::engine::StorageEngine,
+    storage: &bitevachat_storage::engine::StorageEngine,
     address: bitevachat_types::Address,
     blocked: bool,
 ) -> std::result::Result<(), BitevachatError> {
-    let action = if blocked { "block" } else { "unblock" };
-    tracing::debug!(%address, action, "BlockContact: stub -- not persisted");
+    let contact_store = storage.contacts()?;
+    if blocked {
+        contact_store.block(&address)?;
+        tracing::info!(%address, "contact blocked");
+    } else {
+        contact_store.unblock(&address)?;
+        tracing::info!(%address, "contact unblocked");
+    }
     Ok(())
 }
 
 fn handle_list_contacts(
-    _storage: &bitevachat_storage::engine::StorageEngine,
+    storage: &bitevachat_storage::engine::StorageEngine,
 ) -> std::result::Result<Vec<ContactInfo>, BitevachatError> {
-    tracing::debug!("ListContacts: stub -- returning empty");
-    Ok(Vec::new())
+    let contact_store = storage.contacts()?;
+    let entries = contact_store.list_contacts()?;
+
+    let results: Vec<ContactInfo> = entries
+        .into_iter()
+        .map(|(address, record)| ContactInfo {
+            address,
+            alias: record.alias.unwrap_or_default(),
+            blocked: record.blocked,
+        })
+        .collect();
+
+    tracing::debug!(count = results.len(), "ListContacts: returning contacts");
+    Ok(results)
 }
 
 // ---------------------------------------------------------------------------
@@ -535,10 +692,23 @@ fn handle_list_contacts(
 // ---------------------------------------------------------------------------
 
 fn handle_list_peers(
-    _rt: &NodeRuntime,
+    rt: &NodeRuntime,
 ) -> std::result::Result<Vec<PeerInfo>, BitevachatError> {
-    tracing::debug!("ListPeers: stub -- returning empty");
-    Ok(Vec::new())
+    let peers: Vec<PeerInfo> = rt
+        .network
+        .connected_peers()
+        .into_iter()
+        .map(|peer_id| {
+            let node_id = peer_id_to_node_id(&peer_id);
+            PeerInfo {
+                peer_id: peer_id.to_string(),
+                node_id,
+            }
+        })
+        .collect();
+
+    tracing::debug!(count = peers.len(), "ListPeers: returning connected peers");
+    Ok(peers)
 }
 
 // ---------------------------------------------------------------------------
@@ -555,13 +725,31 @@ fn handle_inject_message(
 
     let convo_id = incoming::compute_convo_id(sender, recipient);
 
-    let _msg_store = storage.messages()?;
-    drop(_msg_store);
+    let type_byte = match envelope.message.payload_type {
+        bitevachat_types::PayloadType::Text => 0u8,
+        bitevachat_types::PayloadType::File => 1u8,
+        bitevachat_types::PayloadType::System => 2u8,
+    };
+
+    let stored = bitevachat_storage::messages::StoredMessage {
+        sender: *sender.as_bytes(),
+        recipient: *recipient.as_bytes(),
+        message_id: *message_id.as_bytes(),
+        convo_id: *convo_id.as_bytes(),
+        timestamp_millis: envelope.message.timestamp.as_datetime().timestamp_millis(),
+        payload_type: type_byte,
+        payload_ciphertext: envelope.message.payload_ciphertext.clone(),
+        nonce: *envelope.message.nonce.as_bytes(),
+        signature: envelope.signature.as_bytes().to_vec(),
+    };
+
+    let msg_store = storage.messages()?;
+    msg_store.store_message(&stored)?;
 
     tracing::info!(
         %message_id,
         %sender,
-        "injected message stored (pending MessageStore.put integration)"
+        "injected message stored"
     );
 
     Ok(message_id)
@@ -572,13 +760,20 @@ fn handle_inject_message(
 // ---------------------------------------------------------------------------
 
 fn handle_pending_tick(
-    scheduler: &PendingScheduler,
-    pending_queue: &std::sync::Arc<bitevachat_storage::pending::PendingQueue>,
+    rt: &mut NodeRuntime,
 ) {
-    let ready = match scheduler.tick() {
+    let now = Timestamp::now();
+
+    // 1. Purge expired entries (7 day TTL).
+    if let Err(e) = rt.pending_queue.purge_expired(7, &now) {
+        tracing::warn!(%e, "failed to purge expired pending entries");
+    }
+
+    // 2. Dequeue entries whose backoff has elapsed.
+    let ready = match rt.pending_queue.dequeue_ready(&now) {
         Ok(entries) => entries,
         Err(e) => {
-            tracing::warn!(%e, "pending scheduler tick failed");
+            tracing::warn!(%e, "pending dequeue_ready failed");
             return;
         }
     };
@@ -587,12 +782,41 @@ fn handle_pending_tick(
         return;
     }
 
-    tracing::debug!(count = ready.len(), "pending scheduler: retrying messages");
+    tracing::debug!(count = ready.len(), "pending tick: retrying messages");
 
+    // 3. Attempt delivery for each ready entry.
     for entry in &ready {
-        let msg_id = entry.message_id().clone();
-        let now = Timestamp::now();
-        let _ = pending_queue.mark_failed(&msg_id, &now);
+        let msg_id = *entry.message_id();
+
+        match rt.network.try_deliver_to_address(
+            &entry.recipient,
+            entry.envelope.clone(),
+            msg_id,
+        ) {
+            Ok(()) => {
+                // Delivery dispatched — the ACK handler
+                // (NetworkEvent::DeliveryAck) will call
+                // pending_queue.mark_delivered() when the
+                // recipient acknowledges receipt.
+                tracing::debug!(
+                    %msg_id,
+                    recipient = %entry.recipient,
+                    "pending retry: dispatched to connected peer"
+                );
+            }
+            Err(e) => {
+                // Peer not known or not connected — bump retry count
+                // so exponential backoff kicks in.
+                let fail_now = Timestamp::now();
+                let _ = rt.pending_queue.mark_failed(&msg_id, &fail_now);
+                tracing::debug!(
+                    %msg_id,
+                    %e,
+                    retry = entry.retry_count + 1,
+                    "pending retry: delivery failed, will backoff"
+                );
+            }
+        }
     }
 }
 

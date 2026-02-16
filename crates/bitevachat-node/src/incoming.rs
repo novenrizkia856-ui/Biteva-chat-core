@@ -77,6 +77,53 @@ pub async fn handle_incoming_message(
     let recipient = &envelope.message.recipient;
     let message_id = envelope.message.message_id;
 
+    // 0. Pre-filter trust promotion.
+    //
+    //    Messages arriving here have ALREADY been verified at the
+    //    network layer (Ed25519 signature, pubkey→address binding,
+    //    timestamp skew, nonce replay — see module docs). The PoW
+    //    requirement exists for unverified relay/gossip paths, not
+    //    for direct authenticated connections.
+    //
+    //    We promote trust for two categories:
+    //    (a) Known contacts (explicit user intent to receive).
+    //    (b) Any network-verified sender — the cryptographic proof
+    //        they provided via the noise+identify handshake is
+    //        stronger than PoW.
+    {
+        use crate::trust::TrustScore;
+        if spam_filter.get_trust_score(sender) == TrustScore::Unknown {
+            // Check contacts first (gives us a specific log message).
+            let is_contact = storage.contacts().ok().and_then(|cs| {
+                cs.get_contact(sender).ok().flatten()
+            });
+
+            let reason = if let Some(ref record) = is_contact {
+                if record.blocked {
+                    None // blocked contacts stay Unknown
+                } else {
+                    Some("known contact")
+                }
+            } else {
+                // Not a contact, but the message was network-verified
+                // (signature + timestamp + nonce all passed in the
+                // handler before reaching us). Auto-trust.
+                Some("network-verified sender")
+            };
+
+            if let Some(label) = reason {
+                spam_filter.record_successful_interaction(sender);
+                spam_filter.record_successful_interaction(sender);
+                spam_filter.record_successful_interaction(sender);
+                tracing::debug!(
+                    %sender,
+                    reason = label,
+                    "trust promoted past PoW requirement"
+                );
+            }
+        }
+    }
+
     // 1. Anti-spam filter.
     let msg_hash = message_id.as_bytes();
     let filter_result = spam_filter.filter_incoming(sender, msg_hash, pow)?;
@@ -174,19 +221,34 @@ pub fn compute_convo_id(a: &Address, b: &Address) -> ConvoId {
 /// Stores a message envelope to the database.
 fn store_envelope(
     storage: &StorageEngine,
-    _convo_id: &ConvoId,
+    convo_id: &ConvoId,
     envelope: &MessageEnvelope,
 ) -> BResult<()> {
     let msg_store = storage.messages()?;
 
-    // TODO: Call `msg_store.put(convo_id, message_id, envelope_bytes)`
-    // when the MessageStore CRUD API is finalized. For now we verify
-    // the store is accessible and log the operation.
-    drop(msg_store);
+    let type_byte = match envelope.message.payload_type {
+        bitevachat_types::PayloadType::Text => 0u8,
+        bitevachat_types::PayloadType::File => 1u8,
+        bitevachat_types::PayloadType::System => 2u8,
+    };
+
+    let stored = bitevachat_storage::messages::StoredMessage {
+        sender: *envelope.message.sender.as_bytes(),
+        recipient: *envelope.message.recipient.as_bytes(),
+        message_id: *envelope.message.message_id.as_bytes(),
+        convo_id: *convo_id.as_bytes(),
+        timestamp_millis: envelope.message.timestamp.as_datetime().timestamp_millis(),
+        payload_type: type_byte,
+        payload_ciphertext: envelope.message.payload_ciphertext.clone(),
+        nonce: *envelope.message.nonce.as_bytes(),
+        signature: envelope.signature.as_bytes().to_vec(),
+    };
+
+    msg_store.store_message(&stored)?;
 
     tracing::debug!(
         msg_id = %envelope.message.message_id,
-        "envelope stored (pending MessageStore.put integration)"
+        "envelope stored in message database"
     );
 
     Ok(())

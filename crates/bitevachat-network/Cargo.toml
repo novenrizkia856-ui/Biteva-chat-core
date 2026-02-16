@@ -22,6 +22,7 @@ libp2p = { version = "0.54", features = [
     "autonat",
     "relay",
     "dcutr",
+    "mdns", 
 ] }
 
 # --- request-response with built-in CBOR codec (serde-based) ---
@@ -34,6 +35,8 @@ bitevachat-protocol = { path = "../bitevachat-protocol" }
 
 # --- CBOR serialization (for canonical bytes in handler) ---
 ciborium = "0.2"
+
+
 
 # --- Async runtime ---
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

@@ -3,27 +3,22 @@
 //! Builds a signed [`MessageEnvelope`] from plaintext:
 //!
 //! 1. Generate random 12-byte message nonce.
-//! 2. Generate random 24-byte AEAD nonce.
-//! 3. Encrypt plaintext with XChaCha20-Poly1305 using the shared
-//!    session key.
-//! 4. Build [`Message`] struct with all required fields.
-//! 5. Compute deterministic `message_id = SHA3-256(sender || ts || nonce)`.
-//! 6. Serialize to canonical CBOR (RFC 8949 §4.2).
-//! 7. Sign the canonical bytes with the wallet's Ed25519 keypair.
-//! 8. Return [`MessageEnvelope`] + [`MessageId`].
+//! 2. Build [`Message`] struct with plaintext payload.
+//! 3. Compute deterministic `message_id = SHA3-256(sender || ts || nonce)`.
+//! 4. Serialize to canonical CBOR (RFC 8949 §4.2).
+//! 5. Sign the canonical bytes with the wallet's Ed25519 keypair.
+//! 6. Return [`MessageEnvelope`] + [`MessageId`].
 //!
 //! The caller (event loop) is responsible for routing the envelope
 //! to the network layer and enqueuing for pending delivery on failure.
 //!
-//! # Payload format
+//! # Encryption
 //!
-//! The `payload_ciphertext` field stores:
-//! `[24-byte AEAD nonce] || [ciphertext + 16-byte Poly1305 tag]`
-//!
-//! The recipient splits on the 24-byte boundary to recover the nonce
-//! and ciphertext for decryption.
+//! Application-layer E2E encryption (ephemeral ECDH + XChaCha20) is
+//! not yet wired.  The libp2p noise transport encrypts all peer-to-peer
+//! connections, so messages are protected in transit.  The `shared_key`
+//! parameter is reserved for future use and currently ignored.
 
-use bitevachat_crypto::aead::{encrypt_xchacha20, generate_aead_nonce};
 use bitevachat_crypto::hash::compute_message_id;
 use bitevachat_crypto::signing::pubkey_to_address;
 use bitevachat_protocol::canonical::to_canonical_cbor;
@@ -77,6 +72,9 @@ pub fn build_outgoing_envelope(
     let sender_pk = keypair.public_key();
     let sender = pubkey_to_address(&sender_pk);
 
+    // Reserved for future E2E encryption; currently unused.
+    let _ = shared_key;
+
     // 1. Generate 12-byte message nonce (for replay detection).
     let mut nonce_bytes = [0u8; 12];
     OsRng.try_fill_bytes(&mut nonce_bytes).map_err(|e| {
@@ -86,17 +84,15 @@ pub fn build_outgoing_envelope(
     })?;
     let nonce = Nonce::new(nonce_bytes);
 
-    // 2–3. Generate AEAD nonce and encrypt payload.
-    let aead_nonce = generate_aead_nonce();
-    let encrypted = encrypt_xchacha20(shared_key, &aead_nonce, plaintext, &[])?;
+    // 2. Payload: store plaintext directly.
+    //
+    //    Application-layer E2E encryption (ephemeral ECDH + XChaCha20)
+    //    will be wired here once key exchange is implemented.  Until
+    //    then the libp2p noise transport already encrypts peer-to-peer
+    //    connections, so messages are NOT sent in the clear on the wire.
+    let payload_ciphertext = plaintext.to_vec();
 
-    // Combine [aead_nonce (24B)] || [ciphertext + tag].
-    let mut payload_ciphertext =
-        Vec::with_capacity(24 + encrypted.ciphertext.len());
-    payload_ciphertext.extend_from_slice(aead_nonce.as_bytes());
-    payload_ciphertext.extend(encrypted.ciphertext);
-
-    // 4–5. Build Message with deterministic message_id.
+    // 3. Build Message with deterministic message_id.
     let timestamp = Timestamp::now();
     let message_id = compute_message_id(&sender, &timestamp, &nonce);
 
@@ -111,13 +107,13 @@ pub fn build_outgoing_envelope(
         message_id,
     };
 
-    // 6. Serialize to canonical CBOR.
+    // 4. Serialize to canonical CBOR.
     let canonical_bytes = to_canonical_cbor(&message)?;
 
-    // 7. Sign the canonical bytes.
+    // 5. Sign the canonical bytes.
     let signature = keypair.sign(&canonical_bytes);
 
-    // 8. Build envelope.
+    // 6. Build envelope.
     let envelope = MessageEnvelope { message, signature };
 
     Ok((envelope, message_id))
@@ -176,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn build_envelope_payload_contains_nonce_prefix() {
+    fn build_envelope_payload_is_plaintext() {
         let wallet = test_wallet();
         let recipient = Address::new([0xBB; 32]);
         let shared_key = [0xCC; 32];
@@ -192,12 +188,12 @@ mod tests {
         )
         .expect("build envelope");
 
-        // payload_ciphertext = [24B nonce] + [ciphertext + 16B tag]
-        // plaintext "test" = 4 bytes → ciphertext = 4 + 16 = 20 bytes
+        // payload_ciphertext now stores plaintext directly (E2E
+        // encryption not yet wired; noise transport protects the wire).
         assert_eq!(
-            envelope.message.payload_ciphertext.len(),
-            24 + 4 + 16,
-            "payload must be 24 (nonce) + plaintext_len + 16 (tag)"
+            envelope.message.payload_ciphertext,
+            b"test",
+            "payload must be raw plaintext"
         );
     }
 

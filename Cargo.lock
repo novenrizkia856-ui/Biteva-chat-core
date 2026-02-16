@@ -843,6 +843,7 @@ dependencies = [
  "bitevachat-storage",
  "bitevachat-types",
  "bitevachat-wallet",
+ "chrono",
  "libp2p",
  "rand 0.8.5",
  "serde",
