@@ -2,17 +2,20 @@
 //!
 //! All heavy work is done in the RPC bridge. The `update()` method
 //! only polls for events, mutates state, and renders the current view.
+//!
+//! Startup flow:
+//! 1. Onboarding (detect wallet / create / import / unlock)
+//! 2. Send `BootstrapNode` to bridge → node starts automatically
+//! 3. Bridge auto-connects to embedded RPC → Chat view
 
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tokio::sync::mpsc;
 
-
 use crate::views::{chat, contacts, onboarding, profile, settings};
 use crate::{rpc_bridge, theme};
 use crate::rpc_bridge::{UiCommand, UiEvent};
-
 // ---------------------------------------------------------------------------
 // View enum
 // ---------------------------------------------------------------------------
@@ -54,6 +57,8 @@ pub struct BitevachatApp {
     current_view: View,
     connected: bool,
     onboarding: onboarding::OnboardingState,
+    /// True once the bootstrap command has been sent to the bridge.
+    bootstrap_sent: bool,
     chat: chat::ChatState,
     contact: contacts::ContactState,
     setting: settings::SettingsState,
@@ -79,6 +84,7 @@ impl BitevachatApp {
             current_view: View::Onboarding,
             connected: false,
             onboarding: onboarding::OnboardingState::new(),
+            bootstrap_sent: false,
             chat: chat::ChatState::new(),
             contact: contacts::ContactState::new(),
             setting: settings::SettingsState::new(),
@@ -97,7 +103,6 @@ impl BitevachatApp {
     // -----------------------------------------------------------------------
 
     fn process_events(&mut self, ctx: &egui::Context) {
-        // Drain all pending events.
         loop {
             match self.evt_rx.try_recv() {
                 Ok(event) => self.handle_event(event, ctx),
@@ -112,10 +117,18 @@ impl BitevachatApp {
 
     fn handle_event(&mut self, event: UiEvent, ctx: &egui::Context) {
         match event {
+            UiEvent::NodeStarted { address, rpc_endpoint } => {
+                self.chat.my_address = address.clone();
+                self.prof.profile.address = address;
+                self.setting.rpc_endpoint = rpc_endpoint;
+                self.add_toast("Node started", ToastLevel::Success);
+            }
+
             UiEvent::Connected => {
                 self.connected = true;
-                self.add_toast("Connected to node", ToastLevel::Success);
-                // Trigger initial data fetch.
+                self.current_view = View::Chat;
+                self.add_toast("Connected", ToastLevel::Success);
+                // Initial data fetch.
                 let _ = self.cmd_tx.try_send(UiCommand::GetStatus);
                 let _ = self.cmd_tx.try_send(UiCommand::ListContacts);
             }
@@ -133,7 +146,6 @@ impl BitevachatApp {
                 self.prof.profile.address = status.address.clone();
                 self.node_status = Some(status);
 
-                // First status → fetch own profile.
                 if !self.initial_fetch_done {
                     self.initial_fetch_done = true;
                     let addr = self.chat.my_address.clone();
@@ -148,7 +160,6 @@ impl BitevachatApp {
             UiEvent::MessageSent { message_id } => {
                 self.chat.last_sent_id = Some(message_id);
                 self.chat.scroll_to_bottom = true;
-                // Re-fetch messages for current conversation.
                 if let Some(ref convo) = self.chat.selected_convo {
                     let _ = self.cmd_tx.try_send(UiCommand::ListMessages {
                         convo_id: convo.clone(),
@@ -165,8 +176,6 @@ impl BitevachatApp {
 
             UiEvent::ContactList(contacts) => {
                 self.contact.contacts = contacts.clone();
-
-                // Update chat conversation list from contacts.
                 self.chat.conversations = contacts
                     .iter()
                     .filter(|c| !c.blocked)
@@ -183,9 +192,7 @@ impl BitevachatApp {
                     .collect();
             }
 
-            UiEvent::PeerList(_peers) => {
-                // Peer list can be shown in a future "Network" tab.
-            }
+            UiEvent::PeerList(_peers) => {}
 
             UiEvent::Profile(data) => {
                 self.prof.profile = data;
@@ -211,7 +218,6 @@ impl BitevachatApp {
                 match event_type.as_str() {
                     "message_received" => {
                         self.add_toast("New message received", ToastLevel::Info);
-                        // Re-fetch current conversation.
                         if let Some(ref convo) = self.chat.selected_convo {
                             let _ = self.cmd_tx.try_send(UiCommand::ListMessages {
                                 convo_id: convo.clone(),
@@ -229,6 +235,12 @@ impl BitevachatApp {
 
             UiEvent::Error(msg) => {
                 self.add_toast(&msg, ToastLevel::Error);
+                // If bootstrap failed, allow user to retry.
+                if self.current_view == View::Onboarding && self.bootstrap_sent {
+                    self.bootstrap_sent = false;
+                    self.onboarding.step = onboarding::OnboardingStep::Detect;
+                    self.onboarding.result = None;
+                }
             }
         }
     }
@@ -239,7 +251,6 @@ impl BitevachatApp {
             level,
             created_at: Instant::now(),
         });
-        // Cap toast list.
         if self.toasts.len() > 10 {
             self.toasts.remove(0);
         }
@@ -259,13 +270,35 @@ impl BitevachatApp {
         self.poll_timer = Instant::now();
         let _ = self.cmd_tx.try_send(UiCommand::GetStatus);
 
-        // Refresh current conversation messages.
         if let Some(ref convo) = self.chat.selected_convo {
             let _ = self.cmd_tx.try_send(UiCommand::ListMessages {
                 convo_id: convo.clone(),
                 limit: 100,
                 offset: 0,
             });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Bootstrap trigger
+    // -----------------------------------------------------------------------
+
+    /// Sends the BootstrapNode command to the bridge once the
+    /// onboarding result is ready.
+    fn try_send_bootstrap(&mut self) {
+        if self.bootstrap_sent {
+            return;
+        }
+        if let Some(result) = self.onboarding.result.take() {
+            let cmd = UiCommand::BootstrapNode {
+                data_dir: result.data_dir.clone(),
+                mnemonic: result.mnemonic,
+                passphrase: result.passphrase,
+            };
+            let _ = self.cmd_tx.try_send(cmd);
+            self.bootstrap_sent = true;
+            // Store data dir in settings.
+            self.setting.data_dir = result.data_dir.to_string_lossy().to_string();
         }
     }
 }
@@ -293,10 +326,7 @@ impl eframe::App for BitevachatApp {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let done = onboarding::render(&mut self.onboarding, ui);
                 if done {
-                    self.current_view = View::Chat;
-                    // Auto-connect.
-                    let endpoint = self.setting.rpc_endpoint.clone();
-                    let _ = self.cmd_tx.try_send(UiCommand::Connect { endpoint });
+                    self.try_send_bootstrap();
                 }
             });
             return;
@@ -379,8 +409,6 @@ fn render_nav_bar(
             };
             if ui.selectable_label(selected, text).clicked() {
                 *current = *view;
-
-                // Fetch data for the view being switched to.
                 match view {
                     View::Contacts => {
                         let _ = cmd_tx.try_send(UiCommand::ListContacts);
@@ -408,7 +436,7 @@ fn render_nav_bar(
                 }
             } else {
                 ui.colored_label(theme::DANGER, "disconnected");
-                if ui.small_button("Connect").clicked() {
+                if ui.small_button("Reconnect").clicked() {
                     let _ = cmd_tx.try_send(UiCommand::Connect {
                         endpoint: rpc_endpoint.to_string(),
                     });
@@ -423,7 +451,6 @@ fn render_nav_bar(
 // ---------------------------------------------------------------------------
 
 fn render_toasts(toasts: &mut Vec<Toast>, ctx: &egui::Context) {
-    // Remove expired toasts.
     toasts.retain(|t| t.created_at.elapsed() < TOAST_DURATION);
 
     if toasts.is_empty() {

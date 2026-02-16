@@ -9,6 +9,10 @@ use crate::theme;
 // ---------------------------------------------------------------------------
 
 pub struct SettingsState {
+    /// Data directory path.
+    pub data_dir: String,
+    /// RPC endpoint.
+    pub rpc_endpoint: String,
     /// Message retention (messages per conversation).
     pub retention_messages: u64,
     /// Pending message TTL in days.
@@ -23,8 +27,6 @@ pub struct SettingsState {
     pub blocklist_enabled: bool,
     /// Relay mode toggle (future).
     pub relay_mode: bool,
-    /// RPC endpoint.
-    pub rpc_endpoint: String,
     /// Show backup confirmation modal.
     pub show_backup_modal: bool,
     /// Show change passphrase dialog.
@@ -44,6 +46,8 @@ pub struct SettingsState {
 impl SettingsState {
     pub fn new() -> Self {
         Self {
+            data_dir: String::new(),
+            rpc_endpoint: "http://127.0.0.1:50051".into(),
             retention_messages: 1500,
             pending_ttl_days: 5,
             rate_limit_per_min: 10,
@@ -51,7 +55,6 @@ impl SettingsState {
             pow_enabled: true,
             blocklist_enabled: true,
             relay_mode: false,
-            rpc_endpoint: "http://127.0.0.1:50051".into(),
             show_backup_modal: false,
             show_passphrase_dialog: false,
             old_passphrase: String::new(),
@@ -73,6 +76,16 @@ pub fn render(state: &mut SettingsState, ui: &mut egui::Ui) {
     ui.separator();
 
     egui::ScrollArea::vertical().show(ui, |ui| {
+        // ---- Data Directory ----
+        ui.add_space(theme::SECTION_SPACING);
+        ui.label(
+            egui::RichText::new("Data Directory")
+                .size(theme::FONT_BODY)
+                .strong(),
+        );
+        ui.add_space(theme::ITEM_SPACING);
+        ui.label(theme::muted(&state.data_dir));
+
         // ---- Storage & Retention ----
         ui.add_space(theme::SECTION_SPACING);
         ui.label(

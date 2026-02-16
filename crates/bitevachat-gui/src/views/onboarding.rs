@@ -1,102 +1,95 @@
-//! Wallet onboarding flow: create or import.
+//! Wallet onboarding and unlock flow.
+//!
+//! Scenarios:
+//! - **No wallet file** → full onboarding (create or import).
+//! - **Wallet file exists** → passphrase unlock screen.
 //!
 //! Seed words are displayed once, then cleared from memory.
 //! No seed data is written to logs.
 
-use eframe::egui;
+use std::path::PathBuf;
 
+use eframe::egui;
+use zeroize::Zeroize;
+
+use crate::embedded;
 use crate::theme;
 
 // ---------------------------------------------------------------------------
-// BIP39-like word list (subset for display — 256 words)
+// Onboarding result (consumed by app.rs)
 // ---------------------------------------------------------------------------
 
-/// Minimal deterministic wordlist for seed display.
-/// Production builds should use the full BIP39 English wordlist
-/// via the `bip39` crate integrated with `bitevachat-wallet`.
-const WORDLIST: &[&str] = &[
-    "abandon", "ability", "able", "about", "above", "absent", "absorb",
-    "abstract", "absurd", "abuse", "access", "accident", "account",
-    "accuse", "achieve", "acid", "acoustic", "acquire", "across", "act",
-    "action", "actor", "actress", "actual", "adapt", "add", "addict",
-    "address", "adjust", "admit", "adult", "advance", "advice", "aerobic",
-    "affair", "afford", "afraid", "again", "age", "agent", "agree",
-    "ahead", "aim", "air", "airport", "aisle", "alarm", "album",
-    "alcohol", "alert", "alien", "all", "alley", "allow", "almost",
-    "alone", "alpha", "already", "also", "alter", "always", "amateur",
-    "amazing", "among", "amount", "amused", "analyst", "anchor", "ancient",
-    "anger", "angle", "angry", "animal", "ankle", "announce", "annual",
-    "another", "answer", "antenna", "antique", "anxiety", "any", "apart",
-    "apology", "appear", "apple", "approve", "april", "arch", "arctic",
-    "area", "arena", "argue", "arm", "armed", "armor", "army",
-    "around", "arrange", "arrest", "arrive", "arrow", "art", "artefact",
-    "artist", "artwork", "ask", "aspect", "assault", "asset", "assist",
-    "assume", "asthma", "athlete", "atom", "attack", "attend", "attitude",
-    "attract", "auction", "audit", "august", "aunt", "author", "auto",
-    "autumn", "average", "avocado", "avoid", "awake", "aware", "awesome",
-    "awful", "awkward", "axis", "baby", "bachelor", "bacon", "badge",
-    "bag", "balance", "balcony", "ball", "bamboo", "banana", "banner",
-    "bar", "barely", "bargain", "barrel", "base", "basic", "basket",
-    "battle", "beach", "bean", "beauty", "because", "become", "beef",
-    "before", "begin", "behave", "behind", "believe", "below", "bench",
-    "benefit", "best", "betray", "better", "between", "beyond", "bicycle",
-    "bid", "bike", "bind", "biology", "bird", "birth", "bitter",
-    "black", "blade", "blame", "blanket", "blast", "bleak", "bless",
-    "blind", "blood", "blossom", "blow", "blue", "blur", "blush",
-    "board", "boat", "body", "boil", "bomb", "bone", "bonus",
-    "book", "boost", "border", "boring", "borrow", "boss", "bottom",
-    "bounce", "box", "boy", "bracket", "brain", "brand", "brass",
-    "brave", "bread", "breeze", "brick", "bridge", "brief", "bright",
-    "bring", "brisk", "broccoli", "broken", "bronze", "broom", "brother",
-    "brown", "brush", "bubble", "buddy", "budget", "buffalo", "build",
-    "bulb", "bulk", "bullet", "bundle", "bunny", "burden", "burger",
-    "burst", "bus", "business", "busy", "butter", "buyer", "buzz",
-    "cabbage", "cabin", "cable", "cactus", "cage", "cake", "call",
-];
+/// Produced when onboarding completes. Contains everything needed
+/// to bootstrap the embedded node.
+pub struct OnboardingResult {
+    pub data_dir: PathBuf,
+    /// `Some(mnemonic)` for new wallets, `None` for existing.
+    pub mnemonic: Option<String>,
+    pub passphrase: String,
+}
 
 // ---------------------------------------------------------------------------
-// Onboarding state
+// Steps
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OnboardingStep {
+    /// Detect wallet: if exists → UnlockExisting, else → Welcome.
+    Detect,
+    /// Passphrase prompt for an existing wallet.
+    UnlockExisting,
+    /// Choose: create or import.
     Welcome,
+    /// About to generate seed.
     CreateSeed,
+    /// Displaying the 24 words.
     DisplaySeed,
+    /// Confirm 4 selected words.
     ConfirmSeed,
+    /// Set passphrase (new wallet).
     SetPassphrase,
+    /// Import: enter 24 words.
     ImportEnterWords,
+    /// Import: set passphrase.
     ImportPassphrase,
-    Done,
+    /// Starting node (progress indicator).
+    Starting,
 }
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
 
 pub struct OnboardingState {
     pub step: OnboardingStep,
-    /// Generated seed words (cleared after confirmation).
+    /// Data directory path (user-editable).
+    pub data_dir: String,
+    /// Generated or imported seed words (cleared after use).
     seed_words: Vec<String>,
-    /// User-entered confirmation words.
+    /// Confirmation input.
     confirm_input: String,
-    /// Import: user enters 24 words here.
+    /// Import text area.
     import_input: String,
-    /// Passphrase input (zeroized after use).
+    /// Passphrase inputs.
     passphrase: String,
-    /// Passphrase confirmation.
     passphrase_confirm: String,
-    /// Confirmation checkboxes.
+    /// Checkboxes.
     check_written: bool,
     check_understand: bool,
-    /// Error message for validation.
+    /// Error message.
     error_msg: String,
-    /// Whether onboarding completed successfully.
-    pub completed: bool,
-    /// The wallet address after creation (for display).
-    pub wallet_address: String,
+    /// Completed result — consumed by app.rs.
+    pub result: Option<OnboardingResult>,
 }
 
 impl OnboardingState {
     pub fn new() -> Self {
+        let default_dir = embedded::default_data_dir();
+        let data_dir_str = default_dir.to_string_lossy().to_string();
+
         Self {
-            step: OnboardingStep::Welcome,
+            step: OnboardingStep::Detect,
+            data_dir: data_dir_str,
             seed_words: Vec::new(),
             confirm_input: String::new(),
             import_input: String::new(),
@@ -105,57 +98,51 @@ impl OnboardingState {
             check_written: false,
             check_understand: false,
             error_msg: String::new(),
-            completed: false,
-            wallet_address: String::new(),
+            result: None,
         }
     }
 
-    /// Clears sensitive data from memory.
+    /// Clears all sensitive data from memory.
     fn clear_sensitive(&mut self) {
-        // Overwrite seed words.
         for word in &mut self.seed_words {
-            // Fill with zeros before dropping.
             let len = word.len();
-            *word = "0".repeat(len);
+            *word = "\0".repeat(len);
         }
         self.seed_words.clear();
 
-        // Overwrite passphrases.
-        let pp_len = self.passphrase.len();
-        self.passphrase = "0".repeat(pp_len);
-        self.passphrase.clear();
-
-        let pc_len = self.passphrase_confirm.len();
-        self.passphrase_confirm = "0".repeat(pc_len);
-        self.passphrase_confirm.clear();
-
-        let ci_len = self.confirm_input.len();
-        self.confirm_input = "0".repeat(ci_len);
-        self.confirm_input.clear();
-
-        let ii_len = self.import_input.len();
-        self.import_input = "0".repeat(ii_len);
-        self.import_input.clear();
+        zeroize_string(&mut self.passphrase);
+        zeroize_string(&mut self.passphrase_confirm);
+        zeroize_string(&mut self.confirm_input);
+        zeroize_string(&mut self.import_input);
     }
 
-    /// Generates 24 seed words from random indices.
-    fn generate_seed(&mut self) {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        self.seed_words.clear();
-        let list_len = WORDLIST.len();
-        for _ in 0..24 {
-            let idx = rng.gen_range(0..list_len);
-            self.seed_words.push(WORDLIST[idx].to_string());
-        }
+    /// Generates 24 BIP39 seed words using the `bip39` crate.
+    fn generate_seed(&mut self) -> Result<(), String> {
+        use rand::RngCore;
+        let mut entropy = [0u8; 32]; // 256 bits → 24 words
+        rand::thread_rng().fill_bytes(&mut entropy);
+        let mnemonic = bip39::Mnemonic::from_entropy(&entropy)
+            .map_err(|e| format!("mnemonic generation failed: {e}"))?;
+        let phrase = mnemonic.to_string();
+        self.seed_words = phrase
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        Ok(())
     }
 }
 
+fn zeroize_string(s: &mut String) {
+    // Overwrite with zeros before clearing.
+    let bytes = unsafe { s.as_bytes_mut() };
+    bytes.zeroize();
+    s.clear();
+}
+
 // ---------------------------------------------------------------------------
-// Render
+// Render — returns true when result is ready
 // ---------------------------------------------------------------------------
 
-/// Renders the onboarding wizard. Returns `true` when complete.
 pub fn render(state: &mut OnboardingState, ui: &mut egui::Ui) -> bool {
     ui.vertical_centered(|ui| {
         ui.add_space(theme::SECTION_SPACING);
@@ -165,6 +152,8 @@ pub fn render(state: &mut OnboardingState, ui: &mut egui::Ui) -> bool {
         ui.add_space(theme::SECTION_SPACING * 2.0);
 
         match state.step.clone() {
+            OnboardingStep::Detect => render_detect(state, ui),
+            OnboardingStep::UnlockExisting => render_unlock_existing(state, ui),
             OnboardingStep::Welcome => render_welcome(state, ui),
             OnboardingStep::CreateSeed => render_create_seed(state, ui),
             OnboardingStep::DisplaySeed => render_display_seed(state, ui),
@@ -172,15 +161,95 @@ pub fn render(state: &mut OnboardingState, ui: &mut egui::Ui) -> bool {
             OnboardingStep::SetPassphrase => render_set_passphrase(state, ui),
             OnboardingStep::ImportEnterWords => render_import_words(state, ui),
             OnboardingStep::ImportPassphrase => render_import_passphrase(state, ui),
-            OnboardingStep::Done => render_done(state, ui),
+            OnboardingStep::Starting => render_starting(state, ui),
         }
     });
 
-    state.completed
+    state.result.is_some()
 }
 
+// ---------------------------------------------------------------------------
+// Step: Detect
+// ---------------------------------------------------------------------------
+
+fn render_detect(state: &mut OnboardingState, ui: &mut egui::Ui) {
+    ui.label(theme::body("Checking for existing wallet..."));
+    ui.add_space(theme::SECTION_SPACING);
+
+    // Data directory selector.
+    render_data_dir_picker(state, ui);
+    ui.add_space(theme::SECTION_SPACING);
+
+    if theme::accent_button(ui, "Continue").clicked() {
+        let dir = PathBuf::from(&state.data_dir);
+        if embedded::wallet_exists_in(&dir) {
+            state.step = OnboardingStep::UnlockExisting;
+        } else {
+            state.step = OnboardingStep::Welcome;
+        }
+        state.error_msg.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Step: Unlock existing wallet
+// ---------------------------------------------------------------------------
+
+fn render_unlock_existing(state: &mut OnboardingState, ui: &mut egui::Ui) {
+    ui.label(theme::body("Wallet found. Enter your passphrase to unlock:"));
+    ui.add_space(theme::SECTION_SPACING);
+
+    render_data_dir_picker(state, ui);
+    ui.add_space(theme::ITEM_SPACING);
+
+    ui.label("Passphrase:");
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut state.passphrase)
+            .password(true)
+            .desired_width(300.0)
+            .hint_text("Enter your wallet passphrase"),
+    );
+
+    if !state.error_msg.is_empty() {
+        ui.colored_label(theme::DANGER, &state.error_msg);
+    }
+
+    ui.add_space(theme::SECTION_SPACING);
+
+    let enter = resp.lost_focus()
+        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let clicked = theme::accent_button(ui, "Unlock & Start").clicked();
+
+    if (enter || clicked) && !state.passphrase.is_empty() {
+        let passphrase = state.passphrase.clone();
+        let data_dir = PathBuf::from(&state.data_dir);
+
+        state.result = Some(OnboardingResult {
+            data_dir,
+            mnemonic: None, // existing wallet
+            passphrase,
+        });
+        state.step = OnboardingStep::Starting;
+    }
+
+    ui.add_space(theme::ITEM_SPACING);
+    if ui.button("Use different wallet directory").clicked() {
+        state.step = OnboardingStep::Detect;
+    }
+    if ui.button("Create new wallet instead").clicked() {
+        state.step = OnboardingStep::Welcome;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Step: Welcome (new wallet)
+// ---------------------------------------------------------------------------
+
 fn render_welcome(state: &mut OnboardingState, ui: &mut egui::Ui) {
-    ui.label(theme::body("Welcome. Create a new wallet or import an existing one."));
+    ui.label(theme::body("No wallet found. Create a new wallet or import an existing one."));
+    ui.add_space(theme::SECTION_SPACING);
+
+    render_data_dir_picker(state, ui);
     ui.add_space(theme::SECTION_SPACING);
 
     if theme::accent_button(ui, "Create New Wallet").clicked() {
@@ -192,6 +261,10 @@ fn render_welcome(state: &mut OnboardingState, ui: &mut egui::Ui) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Step: Create seed
+// ---------------------------------------------------------------------------
+
 fn render_create_seed(state: &mut OnboardingState, ui: &mut egui::Ui) {
     ui.label(theme::body(
         "A new wallet will be generated. You will be shown 24 seed words.",
@@ -202,9 +275,20 @@ fn render_create_seed(state: &mut OnboardingState, ui: &mut egui::Ui) {
     ));
     ui.add_space(theme::SECTION_SPACING);
 
+    if !state.error_msg.is_empty() {
+        ui.colored_label(theme::DANGER, &state.error_msg);
+    }
+
     if theme::accent_button(ui, "Generate Seed").clicked() {
-        state.generate_seed();
-        state.step = OnboardingStep::DisplaySeed;
+        match state.generate_seed() {
+            Ok(()) => {
+                state.error_msg.clear();
+                state.step = OnboardingStep::DisplaySeed;
+            }
+            Err(e) => {
+                state.error_msg = e;
+            }
+        }
     }
     ui.add_space(theme::ITEM_SPACING);
     if ui.button("Back").clicked() {
@@ -212,11 +296,14 @@ fn render_create_seed(state: &mut OnboardingState, ui: &mut egui::Ui) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Step: Display seed
+// ---------------------------------------------------------------------------
+
 fn render_display_seed(state: &mut OnboardingState, ui: &mut egui::Ui) {
     ui.label(theme::body("Write down these 24 words in order:"));
     ui.add_space(theme::SECTION_SPACING);
 
-    // Display seed words in a 4-column grid.
     egui::Grid::new("seed_grid")
         .num_columns(4)
         .spacing([20.0, 8.0])
@@ -250,6 +337,10 @@ fn render_display_seed(state: &mut OnboardingState, ui: &mut egui::Ui) {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// Step: Confirm seed
+// ---------------------------------------------------------------------------
 
 fn render_confirm_seed(state: &mut OnboardingState, ui: &mut egui::Ui) {
     ui.label(theme::body("Enter word #1, #6, #12, and #24 to confirm:"));
@@ -301,11 +392,15 @@ fn render_confirm_seed(state: &mut OnboardingState, ui: &mut egui::Ui) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Step: Set passphrase (new wallet)
+// ---------------------------------------------------------------------------
+
 fn render_set_passphrase(state: &mut OnboardingState, ui: &mut egui::Ui) {
     ui.label(theme::body("Set a passphrase to encrypt your wallet:"));
     ui.add_space(theme::SECTION_SPACING);
 
-    ui.label("Passphrase:");
+    ui.label("Passphrase (min 8 characters):");
     ui.add(
         egui::TextEdit::singleline(&mut state.passphrase)
             .password(true)
@@ -325,19 +420,32 @@ fn render_set_passphrase(state: &mut OnboardingState, ui: &mut egui::Ui) {
     }
 
     ui.add_space(theme::SECTION_SPACING);
-    if theme::accent_button(ui, "Create Wallet").clicked() {
+    if theme::accent_button(ui, "Create Wallet & Start").clicked() {
         if state.passphrase.len() < 8 {
             state.error_msg = "Passphrase must be at least 8 characters.".into();
         } else if state.passphrase != state.passphrase_confirm {
             state.error_msg = "Passphrases do not match.".into();
         } else {
             state.error_msg.clear();
-            // Clear sensitive data immediately after "creation".
+            // Build the mnemonic string.
+            let mnemonic = state.seed_words.join(" ");
+            let passphrase = state.passphrase.clone();
+            let data_dir = PathBuf::from(&state.data_dir);
+
+            state.result = Some(OnboardingResult {
+                data_dir,
+                mnemonic: Some(mnemonic),
+                passphrase,
+            });
             state.clear_sensitive();
-            state.step = OnboardingStep::Done;
+            state.step = OnboardingStep::Starting;
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Step: Import words
+// ---------------------------------------------------------------------------
 
 fn render_import_words(state: &mut OnboardingState, ui: &mut egui::Ui) {
     ui.label(theme::body("Enter your 24 seed words separated by spaces:"));
@@ -372,11 +480,15 @@ fn render_import_words(state: &mut OnboardingState, ui: &mut egui::Ui) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Step: Import passphrase
+// ---------------------------------------------------------------------------
+
 fn render_import_passphrase(state: &mut OnboardingState, ui: &mut egui::Ui) {
     ui.label(theme::body("Set a passphrase to encrypt the imported wallet:"));
     ui.add_space(theme::SECTION_SPACING);
 
-    ui.label("Passphrase:");
+    ui.label("Passphrase (min 8 characters):");
     ui.add(
         egui::TextEdit::singleline(&mut state.passphrase)
             .password(true)
@@ -396,15 +508,24 @@ fn render_import_passphrase(state: &mut OnboardingState, ui: &mut egui::Ui) {
     }
 
     ui.add_space(theme::SECTION_SPACING);
-    if theme::accent_button(ui, "Import Wallet").clicked() {
+    if theme::accent_button(ui, "Import Wallet & Start").clicked() {
         if state.passphrase.len() < 8 {
             state.error_msg = "Passphrase must be at least 8 characters.".into();
         } else if state.passphrase != state.passphrase_confirm {
             state.error_msg = "Passphrases do not match.".into();
         } else {
             state.error_msg.clear();
+            let mnemonic = state.seed_words.join(" ");
+            let passphrase = state.passphrase.clone();
+            let data_dir = PathBuf::from(&state.data_dir);
+
+            state.result = Some(OnboardingResult {
+                data_dir,
+                mnemonic: Some(mnemonic),
+                passphrase,
+            });
             state.clear_sensitive();
-            state.step = OnboardingStep::Done;
+            state.step = OnboardingStep::Starting;
         }
     }
 
@@ -414,17 +535,34 @@ fn render_import_passphrase(state: &mut OnboardingState, ui: &mut egui::Ui) {
     }
 }
 
-fn render_done(state: &mut OnboardingState, ui: &mut egui::Ui) {
+// ---------------------------------------------------------------------------
+// Step: Starting (progress indicator)
+// ---------------------------------------------------------------------------
+
+fn render_starting(_state: &mut OnboardingState, ui: &mut egui::Ui) {
     ui.label(
-        egui::RichText::new("Wallet ready.")
+        egui::RichText::new("Starting node...")
             .size(theme::FONT_HEADER)
-            .color(theme::SUCCESS),
+            .color(theme::ACCENT),
     );
     ui.add_space(theme::SECTION_SPACING);
-    ui.label(theme::body("Your wallet has been created. You can now connect to a node."));
-    ui.add_space(theme::SECTION_SPACING);
+    ui.spinner();
+    ui.add_space(theme::ITEM_SPACING);
+    ui.label(theme::muted("Initializing wallet, storage, and network. This may take a moment."));
+}
 
-    if theme::accent_button(ui, "Enter Bitevachat").clicked() {
-        state.completed = true;
-    }
+// ---------------------------------------------------------------------------
+// Data directory picker (shared widget)
+// ---------------------------------------------------------------------------
+
+fn render_data_dir_picker(state: &mut OnboardingState, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.label("Data directory:");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.data_dir)
+                .desired_width(400.0)
+                .hint_text("Path to store wallet and data"),
+        );
+    });
+    ui.label(theme::muted("Wallet, storage, and configuration will be saved here."));
 }

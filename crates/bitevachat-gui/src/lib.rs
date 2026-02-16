@@ -8,3 +8,5 @@ pub mod proto;
 pub mod rpc_bridge;
 pub mod views;
 pub mod theme;
+pub mod embedded;
+pub mod wallet_persistence;

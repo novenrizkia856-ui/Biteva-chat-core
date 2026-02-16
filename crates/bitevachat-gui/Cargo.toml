@@ -23,7 +23,21 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
+hex = "0.4"
+zeroize = "1"
+dirs = "5"
+bip39 = "2"
+
+# Workspace crates — embedded node
+bitevachat-types = { path = "../bitevachat-types" }
+bitevachat-crypto = { path = "../bitevachat-crypto" }
+bitevachat-wallet = { path = "../bitevachat-wallet" }
+bitevachat-storage = { path = "../bitevachat-storage" }
+bitevachat-network = { path = "../bitevachat-network" }
+bitevachat-node = { path = "../bitevachat-node" }
+bitevachat-rpc = { path = "../bitevachat-rpc" }
 
 [build-dependencies]
 tonic-build = "0.12"

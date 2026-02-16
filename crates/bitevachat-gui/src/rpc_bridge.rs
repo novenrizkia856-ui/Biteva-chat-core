@@ -3,12 +3,18 @@
 //! Runs entirely on a dedicated tokio runtime thread. The UI
 //! communicates via bounded channels using `try_send` / `try_recv`
 //! to avoid ever blocking the render loop.
+//!
+//! The bridge now also handles embedded node bootstrap: creating the
+//! wallet, starting the node, starting the RPC server, and then
+//! connecting as a gRPC client.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
 
+use crate::embedded::{self, BootstrapInfo};
 use crate::proto;
 
 // ---------------------------------------------------------------------------
@@ -24,9 +30,6 @@ pub const EVT_CHANNEL_SIZE: usize = 1024;
 /// Polling interval for status / messages when streaming unavailable.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Reconnect delay after connection failure.
-const RECONNECT_DELAY: Duration = Duration::from_secs(5);
-
 /// Connection timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -36,6 +39,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum UiCommand {
+    /// Bootstrap the full embedded node stack, then auto-connect.
+    BootstrapNode {
+        data_dir: PathBuf,
+        /// `Some(words)` for new wallet, `None` for existing wallet.
+        mnemonic: Option<String>,
+        passphrase: String,
+    },
     Connect {
         endpoint: String,
     },
@@ -83,6 +93,11 @@ pub enum UiCommand {
 
 #[derive(Debug, Clone)]
 pub enum UiEvent {
+    /// Embedded node started successfully.
+    NodeStarted {
+        address: String,
+        rpc_endpoint: String,
+    },
     Connected,
     Disconnected(String),
     Status(NodeStatus),
@@ -186,6 +201,7 @@ pub async fn run_bridge(
     evt_tx: mpsc::Sender<UiEvent>,
 ) {
     let mut connection: Option<RpcClients> = None;
+    let mut _bootstrap: Option<BootstrapInfo> = None;
     let mut poll_ticker = tokio::time::interval(POLL_INTERVAL);
     poll_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -197,6 +213,7 @@ pub async fn run_bridge(
                         handle_command(
                             command,
                             &mut connection,
+                            &mut _bootstrap,
                             &evt_tx,
                         ).await;
                     }
@@ -258,9 +275,76 @@ async fn connect_to_node(endpoint: &str) -> Result<RpcClients, String> {
 async fn handle_command(
     cmd: UiCommand,
     connection: &mut Option<RpcClients>,
+    bootstrap: &mut Option<BootstrapInfo>,
     evt_tx: &mpsc::Sender<UiEvent>,
 ) {
     match cmd {
+        // ---------------------------------------------------------------
+        // Embedded node bootstrap
+        // ---------------------------------------------------------------
+        UiCommand::BootstrapNode {
+            data_dir,
+            mnemonic,
+            passphrase,
+        } => {
+            let _ = evt_tx.send(UiEvent::Status(NodeStatus {
+                state: "starting...".into(),
+                ..Default::default()
+            })).await;
+
+            let result = embedded::bootstrap_node(
+                &data_dir,
+                mnemonic.as_deref(),
+                &passphrase,
+            )
+            .await;
+
+            match result {
+                Ok(info) => {
+                    let address = info.address.clone();
+                    let endpoint = info.rpc_endpoint.clone();
+                    *bootstrap = Some(info);
+
+                    let _ = evt_tx.send(UiEvent::NodeStarted {
+                        address: address.clone(),
+                        rpc_endpoint: endpoint.clone(),
+                    }).await;
+
+                    // Small delay for the RPC server to be ready.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+
+                    // Auto-connect to the embedded RPC server.
+                    match connect_to_node(&endpoint).await {
+                        Ok(clients) => {
+                            *connection = Some(clients);
+                            let _ = evt_tx.send(UiEvent::Connected).await;
+                        }
+                        Err(e) => {
+                            // Retry once after a short delay.
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            match connect_to_node(&endpoint).await {
+                                Ok(clients) => {
+                                    *connection = Some(clients);
+                                    let _ = evt_tx.send(UiEvent::Connected).await;
+                                }
+                                Err(e2) => {
+                                    let _ = evt_tx.send(UiEvent::Error(
+                                        format!("node started but RPC connect failed: {e}, retry: {e2}"),
+                                    )).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(UiEvent::Error(e)).await;
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Manual connect (for external node)
+        // ---------------------------------------------------------------
         UiCommand::Connect { endpoint } => {
             match connect_to_node(&endpoint).await {
                 Ok(clients) => {
@@ -394,7 +478,6 @@ async fn handle_command(
             let req = proto::AddContactRequest { address, alias };
             match clients.contact.add_contact(req).await {
                 Ok(_) => {
-                    // Re-fetch contact list.
                     let req2 = proto::ListContactsRequest {};
                     if let Ok(resp) = clients.contact.list_contacts(req2).await {
                         let items: Vec<ContactItem> = resp
@@ -570,12 +653,12 @@ async fn handle_command(
         }
 
         UiCommand::Shutdown => {
-            let Some(ref mut clients) = connection else {
-                return;
-            };
-            let req = proto::ShutdownRequest {};
-            let _ = clients.node.shutdown(req).await;
+            if let Some(ref mut clients) = connection {
+                let req = proto::ShutdownRequest {};
+                let _ = clients.node.shutdown(req).await;
+            }
             *connection = None;
+            *bootstrap = None; // drops BootstrapInfo → signals RPC shutdown
             let _ = evt_tx
                 .send(UiEvent::Disconnected("node shut down".into()))
                 .await;
@@ -603,9 +686,7 @@ async fn poll_status(clients: &mut RpcClients, evt_tx: &mpsc::Sender<UiEvent>) {
             let _ = evt_tx.send(UiEvent::Status(status)).await;
         }
         Err(_) => {
-            // Polling failure is silent — avoids spamming UI with
-            // transient errors. The status display will show stale
-            // data, which is acceptable for polling.
+            // Polling failure is silent.
         }
     }
 }

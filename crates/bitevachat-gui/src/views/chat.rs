@@ -1,7 +1,9 @@
 //! Chat view: sidebar, message list, input area.
 //!
-//! No blocking calls. All data comes from the app state which is
-//! updated asynchronously via the RPC bridge.
+//! Key features for P2P testing:
+//! - Own address displayed prominently with copy button
+//! - "New Chat" button opens dialog to enter peer address
+//! - Conversation auto-created when first message is sent
 
 use eframe::egui;
 
@@ -27,6 +29,16 @@ pub struct ChatState {
     pub scroll_to_bottom: bool,
     /// Message that was just sent (for feedback).
     pub last_sent_id: Option<String>,
+    /// "New Chat" dialog state.
+    pub show_new_chat: bool,
+    /// Address input in new chat dialog.
+    pub new_chat_address: String,
+    /// Alias input in new chat dialog.
+    pub new_chat_alias: String,
+    /// Error in new chat dialog.
+    pub new_chat_error: String,
+    /// Copied-to-clipboard feedback timer.
+    pub copy_feedback_until: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +59,11 @@ impl ChatState {
             my_address: String::new(),
             scroll_to_bottom: false,
             last_sent_id: None,
+            show_new_chat: false,
+            new_chat_address: String::new(),
+            new_chat_alias: String::new(),
+            new_chat_error: String::new(),
+            copy_feedback_until: None,
         }
     }
 }
@@ -55,13 +72,13 @@ impl ChatState {
 // Render
 // ---------------------------------------------------------------------------
 
-/// Renders the full chat view. Returns an optional command to send.
+/// Renders the full chat view.
 pub fn render(
     state: &mut ChatState,
     ctx: &egui::Context,
     cmd_tx: &tokio::sync::mpsc::Sender<UiCommand>,
 ) {
-    // Sidebar: conversation list.
+    // Sidebar: own address + conversation list + new chat dialog.
     egui::SidePanel::left("chat_sidebar")
         .exact_width(theme::SIDEBAR_WIDTH)
         .show(ctx, |ui| {
@@ -83,8 +100,21 @@ pub fn render(
             }
             None => {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.label(theme::muted("Select a conversation to start chatting"));
+                    ui.add_space(80.0);
+                    ui.label(theme::muted("Select a conversation or start a new chat"));
+                    ui.add_space(theme::SECTION_SPACING);
+
+                    // Show own address prominently in empty state too.
+                    if !state.my_address.is_empty() {
+                        ui.label(theme::body("Your address:"));
+                        ui.add_space(4.0);
+                        let addr_text = egui::RichText::new(&state.my_address)
+                            .monospace()
+                            .size(theme::FONT_SMALL);
+                        ui.label(addr_text);
+                        ui.add_space(4.0);
+                        ui.label(theme::muted("Share this with your chat partner"));
+                    }
                 });
             }
         }
@@ -101,16 +131,71 @@ fn render_sidebar(
     cmd_tx: &tokio::sync::mpsc::Sender<UiCommand>,
 ) {
     ui.add_space(theme::PANEL_PADDING);
-    ui.label(theme::header("Chats"));
-    ui.add_space(theme::ITEM_SPACING);
+
+    // ---- Own address with copy button ----
+    if !state.my_address.is_empty() {
+        let frame = egui::Frame::none()
+            .fill(egui::Color32::from_rgb(215, 225, 235))
+            .inner_margin(egui::Margin::same(8.0))
+            .rounding(theme::BUTTON_ROUNDING);
+
+        frame.show(ui, |ui| {
+            ui.label(theme::muted("My Address:"));
+            ui.horizontal(|ui| {
+                let short = theme::truncate_hex(&state.my_address, 20);
+                ui.label(
+                    egui::RichText::new(short)
+                        .monospace()
+                        .size(theme::FONT_SMALL),
+                );
+
+                let showing_feedback = state
+                    .copy_feedback_until
+                    .map(|t| t > std::time::Instant::now())
+                    .unwrap_or(false);
+
+                if showing_feedback {
+                    ui.colored_label(theme::SUCCESS, "Copied!");
+                } else if ui.small_button("Copy").clicked() {
+                    ui.output_mut(|o| o.copied_text = state.my_address.clone());
+                    state.copy_feedback_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                }
+            });
+        });
+
+        ui.add_space(theme::ITEM_SPACING);
+    }
+
+    // ---- Header + New Chat button ----
+    ui.horizontal(|ui| {
+        ui.label(theme::header("Chats"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if theme::accent_button(ui, "+ New").clicked() {
+                state.show_new_chat = true;
+                state.new_chat_address.clear();
+                state.new_chat_alias.clear();
+                state.new_chat_error.clear();
+            }
+        });
+    });
+
     ui.separator();
     ui.add_space(theme::ITEM_SPACING);
 
+    // ---- New chat dialog (inline) ----
+    if state.show_new_chat {
+        render_new_chat_dialog(state, ui, cmd_tx);
+        ui.separator();
+        ui.add_space(theme::ITEM_SPACING);
+    }
+
+    // ---- Conversation list ----
     egui::ScrollArea::vertical().show(ui, |ui| {
         if state.conversations.is_empty() {
             ui.label(theme::muted("No conversations yet"));
             ui.add_space(theme::ITEM_SPACING);
-            ui.label(theme::muted("Send a message to start one"));
+            ui.label(theme::muted("Click \"+ New\" to start a chat"));
         }
 
         let selected = state.selected_convo.clone();
@@ -178,7 +263,6 @@ fn render_sidebar(
             if resp.response.interact(egui::Sense::click()).clicked() {
                 state.selected_convo = Some(entry.peer_address.clone());
                 state.scroll_to_bottom = true;
-                // Request messages for this conversation.
                 let _ = cmd_tx.try_send(UiCommand::ListMessages {
                     convo_id: entry.peer_address.clone(),
                     limit: 100,
@@ -190,10 +274,135 @@ fn render_sidebar(
 }
 
 // ---------------------------------------------------------------------------
+// New Chat dialog
+// ---------------------------------------------------------------------------
+
+fn render_new_chat_dialog(
+    state: &mut ChatState,
+    ui: &mut egui::Ui,
+    cmd_tx: &tokio::sync::mpsc::Sender<UiCommand>,
+) {
+    let frame = egui::Frame::none()
+        .fill(theme::BG_INPUT)
+        .inner_margin(egui::Margin::same(10.0))
+        .rounding(theme::BUTTON_ROUNDING);
+
+    frame.show(ui, |ui| {
+        ui.label(theme::body("New Chat"));
+        ui.add_space(4.0);
+
+        ui.label(theme::muted("Peer address (64 hex):"));
+        ui.add(
+            egui::TextEdit::singleline(&mut state.new_chat_address)
+                .desired_width(ui.available_width() - 8.0)
+                .hint_text("Paste peer address here"),
+        );
+
+        ui.add_space(4.0);
+        ui.label(theme::muted("Alias (optional):"));
+        ui.add(
+            egui::TextEdit::singleline(&mut state.new_chat_alias)
+                .desired_width(ui.available_width() - 8.0)
+                .hint_text("e.g. Alice"),
+        );
+
+        if !state.new_chat_error.is_empty() {
+            ui.colored_label(theme::DANGER, &state.new_chat_error);
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if theme::accent_button(ui, "Start Chat").clicked() {
+                let addr = state.new_chat_address.trim().to_string();
+                if addr.len() != 64 || !addr.chars().all(|c| c.is_ascii_hexdigit()) {
+                    state.new_chat_error = "Address must be 64 hex characters.".into();
+                } else if addr == state.my_address {
+                    state.new_chat_error = "Cannot chat with yourself.".into();
+                } else {
+                    // Add as contact (with alias if provided).
+                    let alias = state.new_chat_alias.trim().to_string();
+                    let _ = cmd_tx.try_send(UiCommand::AddContact {
+                        address: addr.clone(),
+                        alias: alias.clone(),
+                    });
+
+                    // Add to local conversation list immediately.
+                    let already_exists = state
+                        .conversations
+                        .iter()
+                        .any(|c| c.peer_address == addr);
+                    if !already_exists {
+                        state.conversations.push(ConversationEntry {
+                            peer_address: addr.clone(),
+                            alias: if alias.is_empty() {
+                                None
+                            } else {
+                                Some(alias)
+                            },
+                            last_message_time: String::new(),
+                            unread: false,
+                        });
+                    }
+
+                    // Select the conversation.
+                    state.selected_convo = Some(addr.clone());
+                    state.show_new_chat = false;
+                    state.new_chat_error.clear();
+                    state.scroll_to_bottom = true;
+
+                    // Fetch messages for this conversation.
+                    let _ = cmd_tx.try_send(UiCommand::ListMessages {
+                        convo_id: addr,
+                        limit: 100,
+                        offset: 0,
+                    });
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                state.show_new_chat = false;
+            }
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Message list
 // ---------------------------------------------------------------------------
 
 fn render_messages(state: &mut ChatState, ui: &mut egui::Ui) {
+    // Show peer address at top of chat.
+    if let Some(ref convo) = state.selected_convo {
+        let frame = egui::Frame::none()
+            .fill(theme::BG_SIDEBAR)
+            .inner_margin(egui::Margin::same(8.0));
+
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Find alias for this convo.
+                let alias = state
+                    .conversations
+                    .iter()
+                    .find(|c| &c.peer_address == convo)
+                    .and_then(|c| c.alias.as_deref());
+
+                if let Some(name) = alias {
+                    ui.label(
+                        egui::RichText::new(name)
+                            .size(theme::FONT_BODY)
+                            .strong(),
+                    );
+                    ui.label(theme::muted(&theme::truncate_hex(convo, 16)));
+                } else {
+                    ui.label(
+                        egui::RichText::new(&theme::truncate_hex(convo, 24))
+                            .monospace()
+                            .size(theme::FONT_BODY),
+                    );
+                }
+            });
+        });
+    }
+
     let scroll_id = egui::Id::new("chat_scroll");
     let mut scroll = egui::ScrollArea::vertical()
         .id_source(scroll_id)
@@ -211,7 +420,7 @@ fn render_messages(state: &mut ChatState, ui: &mut egui::Ui) {
         if state.messages.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.label(theme::muted("No messages yet"));
+                ui.label(theme::muted("No messages yet. Say hello!"));
             });
             return;
         }
@@ -250,7 +459,6 @@ fn render_bubble(ui: &mut egui::Ui, msg: &MessageItem, is_mine: bool) {
         frame.show(ui, |ui| {
             ui.set_max_width(max_width);
 
-            // Decode payload as UTF-8 text, fallback to hex length.
             let text = String::from_utf8(msg.payload_ciphertext.clone())
                 .unwrap_or_else(|_| {
                     format!("[encrypted: {} bytes]", msg.payload_ciphertext.len())
@@ -258,14 +466,12 @@ fn render_bubble(ui: &mut egui::Ui, msg: &MessageItem, is_mine: bool) {
 
             ui.label(theme::body(&text));
 
-            // Timestamp (small, muted).
             if !msg.timestamp.is_empty() {
-                // Show only time portion if available.
                 let time_display = msg
                     .timestamp
                     .find('T')
                     .map(|idx| &msg.timestamp[idx + 1..])
-                    .and_then(|t| t.find('+').map(|end| &t[..end]))
+                    .and_then(|t| t.find('+').or_else(|| t.find('Z')).map(|end| &t[..end]))
                     .unwrap_or(&msg.timestamp);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                     ui.label(
@@ -313,7 +519,6 @@ fn render_input(
                     });
                     state.input_text.clear();
                     state.scroll_to_bottom = true;
-                    // Re-request focus on the text field.
                     resp.request_focus();
                 }
             }
