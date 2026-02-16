@@ -4,12 +4,20 @@ edition.workspace = true
 version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Command-line client for Bitevachat"
+description = "CLI client for the Bitevachat decentralized chat system"
 
 [[bin]]
-name = "bitevachat-cli"
+name = "bitevachat"
 path = "src/main.rs"
 
 [dependencies]
-bitevachat-types = { path = "../bitevachat-types" }
-bitevachat-rpc = { path = "../bitevachat-rpc" }
+clap = { version = "4", features = ["derive"] }
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-std", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+colored = "2"
+
+[build-dependencies]
+tonic-build = "0.12"

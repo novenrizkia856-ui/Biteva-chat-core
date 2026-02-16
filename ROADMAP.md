@@ -328,7 +328,7 @@
 
 **Tujuan:** Membangun desktop GUI yang user-friendly menggunakan egui (immediate-mode GUI), dengan optional Tauri packaging untuk cross-platform distribution.
 
-**Deskripsi:** GUI berkomunikasi dengan node via gRPC (sama seperti CLI). Layout: sidebar (conversation list + contacts) → main panel (chat view) → top bar (status + settings). Flows: onboarding (create wallet / import seed), chat (send/receive real-time), settings (retention, encryption, network config). "Easy mode": password-only wallet tanpa expose seed. "Advanced mode": full seed backup, key rotation, manual config. Show address short form di UI, full di detail. Responsive real-time updates via gRPC streaming atau polling.
+**Deskripsi:** GUI berkomunikasi dengan node via gRPC (sama seperti CLI). Layout: sidebar (conversation list + contacts) → main panel (chat view) → top bar (status + settings). Flows: onboarding (create wallet / import seed), chat (send/receive real-time), settings (retention, encryption, network config). "Easy mode": password-only wallet tanpa expose seed. "Advanced mode": full seed backup, key rotation, manual config. Show address short form di UI, full di detail. Responsive real-time updates via gRPC streaming atau polling, desain tampilan GUI adalah software classic dan tidak terlalu modern
 
 **Yang dibuat:**
 
