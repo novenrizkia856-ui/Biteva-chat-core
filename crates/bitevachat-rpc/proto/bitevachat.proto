@@ -1,0 +1,175 @@
+syntax = "proto3";
+package bitevachat;
+
+// ---------------------------------------------------------------------------
+// MessageService — send and query messages
+// ---------------------------------------------------------------------------
+
+service MessageService {
+  /// Send an E2E encrypted message to a recipient.
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  /// List messages in a conversation (paginated).
+  rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
+  /// Retrieve a single message by ID.
+  rpc GetMessage(GetMessageRequest) returns (GetMessageResponse);
+}
+
+// ---------------------------------------------------------------------------
+// ContactService — alias, block, unblock
+// ---------------------------------------------------------------------------
+
+service ContactService {
+  /// Add or update a contact alias.
+  rpc AddContact(AddContactRequest) returns (AddContactResponse);
+  /// Block a contact address.
+  rpc BlockContact(BlockContactRequest) returns (BlockContactResponse);
+  /// Unblock a previously blocked contact.
+  rpc UnblockContact(UnblockContactRequest) returns (UnblockContactResponse);
+  /// List all contacts.
+  rpc ListContacts(ListContactsRequest) returns (ListContactsResponse);
+}
+
+// ---------------------------------------------------------------------------
+// NodeService — status, peers, shutdown, inject
+// ---------------------------------------------------------------------------
+
+service NodeService {
+  /// Query current node status.
+  rpc GetStatus(GetStatusRequest) returns (NodeStatusResponse);
+  /// List currently connected peers.
+  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+  /// Initiate graceful shutdown.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+  /// Inject an externally signed message (re-verified before processing).
+  rpc InjectMessage(InjectMessageRequest) returns (InjectMessageResponse);
+}
+
+// ===========================================================================
+// Message types
+// ===========================================================================
+
+// ----- MessageService messages --------------------------------------------
+
+message SendMessageRequest {
+  /// Hex-encoded recipient address (64 hex chars = 32 bytes).
+  string recipient = 1;
+  /// Plaintext payload bytes (will be E2E encrypted by the node).
+  bytes plaintext = 2;
+  /// Payload type: "text", "file", or "system".
+  string payload_type = 3;
+  /// 32-byte pre-derived session key for E2E encryption.
+  bytes shared_key = 4;
+}
+
+message SendMessageResponse {
+  /// Hex-encoded deterministic message ID.
+  string message_id = 1;
+}
+
+message ListMessagesRequest {
+  /// Hex-encoded conversation ID (64 hex chars).
+  string convo_id = 1;
+  /// Maximum messages to return (0 = server default).
+  uint64 limit = 2;
+  /// Pagination offset (0-based).
+  uint64 offset = 3;
+}
+
+message ListMessagesResponse {
+  repeated MessageInfo messages = 1;
+}
+
+message GetMessageRequest {
+  /// Hex-encoded message ID.
+  string message_id = 1;
+}
+
+message GetMessageResponse {
+  /// The message, or empty if not found.
+  MessageInfo message = 1;
+}
+
+/// Read-only message metadata (payload remains E2E encrypted).
+message MessageInfo {
+  string message_id = 1;
+  string sender = 2;
+  string recipient = 3;
+  string timestamp = 4;
+  string payload_type = 5;
+  bytes payload_ciphertext = 6;
+}
+
+// ----- ContactService messages --------------------------------------------
+
+message AddContactRequest {
+  /// Hex-encoded contact address.
+  string address = 1;
+  /// Display alias.
+  string alias = 2;
+}
+message AddContactResponse {}
+
+message BlockContactRequest {
+  /// Hex-encoded address to block.
+  string address = 1;
+}
+message BlockContactResponse {}
+
+message UnblockContactRequest {
+  /// Hex-encoded address to unblock.
+  string address = 1;
+}
+message UnblockContactResponse {}
+
+message ListContactsRequest {}
+
+message ContactEntry {
+  string address = 1;
+  string alias = 2;
+  bool blocked = 3;
+}
+
+message ListContactsResponse {
+  repeated ContactEntry contacts = 1;
+}
+
+// ----- NodeService messages -----------------------------------------------
+
+message GetStatusRequest {}
+
+message NodeStatusResponse {
+  string state = 1;
+  string address = 2;
+  string peer_id = 3;
+  string node_id = 4;
+  repeated string listeners = 5;
+  uint64 pending_count = 6;
+}
+
+message ListPeersRequest {}
+
+message PeerEntry {
+  string peer_id = 1;
+  string node_id = 2;
+}
+
+message ListPeersResponse {
+  repeated PeerEntry peers = 1;
+}
+
+message ShutdownRequest {}
+message ShutdownResponse {}
+
+message InjectMessageRequest {
+  /// Canonical CBOR bytes of the Message (not the envelope).
+  bytes canonical_message = 1;
+  /// 64-byte Ed25519 signature over canonical_message.
+  bytes signature = 2;
+  /// 32-byte sender Ed25519 public key.
+  bytes sender_pubkey = 3;
+}
+
+message InjectMessageResponse {
+  /// Hex-encoded message ID of the injected message.
+  string message_id = 1;
+}

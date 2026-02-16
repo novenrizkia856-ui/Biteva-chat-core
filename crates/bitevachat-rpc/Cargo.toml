@@ -4,7 +4,21 @@ edition.workspace = true
 version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Local gRPC server for UI and external integration"
+description = "gRPC/Unix socket RPC server for Bitevachat Node"
 
 [dependencies]
+bitevachat-node = { path = "../bitevachat-node" }
 bitevachat-types = { path = "../bitevachat-types" }
+bitevachat-crypto = { path = "../bitevachat-crypto" }
+bitevachat-protocol = { path = "../bitevachat-protocol" }
+
+tonic = { version = "0.12", features = ["tls", "transport"] }
+prost = "0.13"
+tokio = { version = "1", features = ["net", "sync", "signal", "macros", "rt-multi-thread"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+
+[build-dependencies]
+tonic-build = "0.12"

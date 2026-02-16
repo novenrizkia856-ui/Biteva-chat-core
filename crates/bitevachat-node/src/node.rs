@@ -29,7 +29,6 @@ use bitevachat_storage::engine::StorageEngine;
 use bitevachat_types::config::AppConfig;
 use bitevachat_types::{BitevachatError, NodeEvent, NodeId};
 use bitevachat_wallet::wallet::Wallet;
-use libp2p::Multiaddr;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 

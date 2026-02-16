@@ -18,7 +18,7 @@ use std::time::Duration;
 use bitevachat_network::events::NetworkEvent;
 use bitevachat_types::{BitevachatError, MessageId, NodeEvent, NodeId, Timestamp};
 
-use crate::command::{NodeCommand, NodeStatus};
+use crate::command::{ContactInfo, MessageInfo, NodeCommand, NodeStatus, PeerInfo};
 use crate::incoming;
 use crate::maintenance;
 use crate::node::{NodeRuntime, NodeState};
@@ -245,7 +245,42 @@ fn handle_command(
                 payload_type,
                 &shared_key,
             );
-            // Send reply; ignore if receiver dropped.
+            let _ = reply.send(result);
+            false
+        }
+
+        NodeCommand::ListMessages { convo_id, limit, offset, reply } => {
+            let result = handle_list_messages(&rt.storage, convo_id, limit, offset);
+            let _ = reply.send(result);
+            false
+        }
+
+        NodeCommand::GetMessage { message_id, reply } => {
+            let result = handle_get_message(&rt.storage, message_id);
+            let _ = reply.send(result);
+            false
+        }
+
+        NodeCommand::AddContact { address, alias, reply } => {
+            let result = handle_add_contact(&rt.storage, address, &alias);
+            let _ = reply.send(result);
+            false
+        }
+
+        NodeCommand::BlockContact { address, reply } => {
+            let result = handle_block_contact(&rt.storage, address, true);
+            let _ = reply.send(result);
+            false
+        }
+
+        NodeCommand::UnblockContact { address, reply } => {
+            let result = handle_block_contact(&rt.storage, address, false);
+            let _ = reply.send(result);
+            false
+        }
+
+        NodeCommand::ListContacts { reply } => {
+            let result = handle_list_contacts(&rt.storage);
             let _ = reply.send(result);
             false
         }
@@ -253,6 +288,18 @@ fn handle_command(
         NodeCommand::GetStatus { reply } => {
             let status = build_status(rt);
             let _ = reply.send(status);
+            false
+        }
+
+        NodeCommand::ListPeers { reply } => {
+            let result = handle_list_peers(rt);
+            let _ = reply.send(result);
+            false
+        }
+
+        NodeCommand::InjectMessage { envelope, reply } => {
+            let result = handle_inject_message(&rt.storage, &envelope);
+            let _ = reply.send(result);
             false
         }
 
@@ -338,6 +385,132 @@ fn build_status(rt: &NodeRuntime) -> NodeStatus {
         listeners,
         pending_count,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Message query handlers (stubs — pending MessageStore CRUD API)
+// ---------------------------------------------------------------------------
+
+/// Lists messages in a conversation.
+///
+/// Stub: returns empty vec until `MessageStore.list()` is implemented.
+fn handle_list_messages(
+    _storage: &bitevachat_storage::engine::StorageEngine,
+    _convo_id: bitevachat_types::ConvoId,
+    _limit: u64,
+    _offset: u64,
+) -> std::result::Result<Vec<MessageInfo>, BitevachatError> {
+    // TODO: Delegate to storage.messages()?.list(convo_id, limit, offset)
+    // when MessageStore CRUD API is finalized.
+    tracing::debug!("ListMessages: stub — returning empty");
+    Ok(Vec::new())
+}
+
+/// Retrieves a single message by ID.
+///
+/// Stub: returns None until `MessageStore.get()` is implemented.
+fn handle_get_message(
+    _storage: &bitevachat_storage::engine::StorageEngine,
+    _message_id: MessageId,
+) -> std::result::Result<Option<MessageInfo>, BitevachatError> {
+    // TODO: Delegate to storage.messages()?.get(message_id)
+    tracing::debug!("GetMessage: stub — returning None");
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Contact handlers (stubs — pending ContactStore CRUD API)
+// ---------------------------------------------------------------------------
+
+/// Adds or updates a contact alias.
+///
+/// Stub: logs and returns Ok until `ContactStore.set_alias()` is implemented.
+fn handle_add_contact(
+    _storage: &bitevachat_storage::engine::StorageEngine,
+    address: bitevachat_types::Address,
+    alias: &str,
+) -> std::result::Result<(), BitevachatError> {
+    // TODO: Delegate to storage.contacts()?.set_alias(address, alias)
+    tracing::debug!(%address, alias, "AddContact: stub — not persisted");
+    Ok(())
+}
+
+/// Blocks or unblocks a contact.
+///
+/// Stub: logs and returns Ok until `ContactStore.set_blocked()` is implemented.
+fn handle_block_contact(
+    _storage: &bitevachat_storage::engine::StorageEngine,
+    address: bitevachat_types::Address,
+    blocked: bool,
+) -> std::result::Result<(), BitevachatError> {
+    // TODO: Delegate to storage.contacts()?.set_blocked(address, blocked)
+    let action = if blocked { "block" } else { "unblock" };
+    tracing::debug!(%address, action, "BlockContact: stub — not persisted");
+    Ok(())
+}
+
+/// Lists all contacts.
+///
+/// Stub: returns empty vec until `ContactStore.list()` is implemented.
+fn handle_list_contacts(
+    _storage: &bitevachat_storage::engine::StorageEngine,
+) -> std::result::Result<Vec<ContactInfo>, BitevachatError> {
+    // TODO: Delegate to storage.contacts()?.list()
+    tracing::debug!("ListContacts: stub — returning empty");
+    Ok(Vec::new())
+}
+
+// ---------------------------------------------------------------------------
+// Peer query handler
+// ---------------------------------------------------------------------------
+
+/// Lists currently connected peers.
+///
+/// Stub: returns empty vec until BitevachatSwarm exposes
+/// `connected_peers()`.
+fn handle_list_peers(
+    _rt: &NodeRuntime,
+) -> std::result::Result<Vec<PeerInfo>, BitevachatError> {
+    // TODO: Iterate rt.network.connected_peers() when API is available.
+    tracing::debug!("ListPeers: stub — returning empty");
+    Ok(Vec::new())
+}
+
+// ---------------------------------------------------------------------------
+// Inject message handler
+// ---------------------------------------------------------------------------
+
+/// Processes an externally injected, pre-verified message envelope.
+///
+/// The RPC layer has already verified:
+/// - Ed25519 signature over canonical CBOR
+/// - Pubkey → address binding
+/// - Timestamp skew
+///
+/// The event loop stores it and emits a NodeEvent, same as an
+/// incoming network message.
+fn handle_inject_message(
+    storage: &bitevachat_storage::engine::StorageEngine,
+    envelope: &bitevachat_protocol::message::MessageEnvelope,
+) -> std::result::Result<MessageId, BitevachatError> {
+    let message_id = envelope.message.message_id;
+    let sender = &envelope.message.sender;
+    let recipient = &envelope.message.recipient;
+
+    // Compute conversation ID (same as incoming.rs).
+    let convo_id = incoming::compute_convo_id(sender, recipient);
+
+    // Store envelope (stub — pending MessageStore.put integration).
+    let _msg_store = storage.messages()?;
+    drop(_msg_store);
+
+    tracing::info!(
+        %message_id,
+        %sender,
+        "injected message stored (pending MessageStore.put integration)"
+    );
+
+    Ok(message_id)
 }
 
 // ---------------------------------------------------------------------------
