@@ -4,10 +4,10 @@ edition.workspace = true
 version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "libp2p network layer for Bitevachat: identity, transport, discovery, swarm"
+description = "libp2p network layer for Bitevachat: identity, transport, discovery, messaging, gossip"
 
 [dependencies]
-# --- libp2p: only features actually used in this crate ---
+# --- libp2p: features for transport, discovery, messaging, gossip ---
 libp2p = { version = "0.54", features = [
     "tokio",
     "tcp",
@@ -16,15 +16,24 @@ libp2p = { version = "0.54", features = [
     "yamux",
     "kad",
     "identify",
+    "request-response",
+    "gossipsub",
     "macros",
 ] }
 
-# --- Bitevachat workspace crates ---
-bitevachat-crypto = { path = "../bitevachat-crypto" }
-bitevachat-types  = { path = "../bitevachat-types" }
+# --- request-response with built-in CBOR codec (serde-based) ---
+libp2p-request-response = { version = "0.27", features = ["cbor"] }
 
-# --- Async runtime (minimal features) ---
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# --- Bitevachat workspace crates ---
+bitevachat-crypto   = { path = "../bitevachat-crypto" }
+bitevachat-types    = { path = "../bitevachat-types" }
+bitevachat-protocol = { path = "../bitevachat-protocol" }
+
+# --- CBOR serialization (for canonical bytes in handler) ---
+ciborium = "0.2"
+
+# --- Async runtime ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 # --- Stream combinators for Swarm event loop ---
 futures = "0.3"
@@ -32,9 +41,10 @@ futures = "0.3"
 # --- Structured logging ---
 tracing = "0.1"
 
-# --- Serialization for NetworkConfig ---
+# --- Serialization for NetworkConfig, WireMessage, Ack ---
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"

@@ -52,7 +52,7 @@ async fn two_nodes_connect_and_exchange_identify() {
         ..NetworkConfig::default()
     };
 
-    let mut swarm_a = BitevachatSwarm::new(config_a.clone(), &keypair_a)
+    let (mut swarm_a, _rx_a) = BitevachatSwarm::new(config_a.clone(), &keypair_a)
         .await
         .expect("failed to create swarm A");
 
@@ -72,7 +72,7 @@ async fn two_nodes_connect_and_exchange_identify() {
         ..NetworkConfig::default()
     };
 
-    let mut swarm_b = BitevachatSwarm::new(config_b.clone(), &keypair_b)
+    let (mut swarm_b, _rx_b) = BitevachatSwarm::new(config_b.clone(), &keypair_b)
         .await
         .expect("failed to create swarm B");
 
@@ -144,11 +144,11 @@ async fn peer_id_is_deterministic() {
 
     let config = NetworkConfig::default();
 
-    let swarm1 = BitevachatSwarm::new(config.clone(), &keypair1)
+    let (swarm1, _rx1) = BitevachatSwarm::new(config.clone(), &keypair1)
         .await
         .expect("failed to create swarm 1");
 
-    let swarm2 = BitevachatSwarm::new(config, &keypair2)
+    let (swarm2, _rx2) = BitevachatSwarm::new(config, &keypair2)
         .await
         .expect("failed to create swarm 2");
 
@@ -167,11 +167,11 @@ async fn different_seeds_different_peer_ids() {
     let kp1 = Keypair::from_seed(&[0x01; 32]);
     let kp2 = Keypair::from_seed(&[0x02; 32]);
 
-    let swarm1 = BitevachatSwarm::new(config.clone(), &kp1)
+    let (swarm1, _rx1) = BitevachatSwarm::new(config.clone(), &kp1)
         .await
         .expect("failed to create swarm 1");
 
-    let swarm2 = BitevachatSwarm::new(config, &kp2)
+    let (swarm2, _rx2) = BitevachatSwarm::new(config, &kp2)
         .await
         .expect("failed to create swarm 2");
 

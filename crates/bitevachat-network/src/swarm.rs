@@ -1,67 +1,131 @@
 //! High-level swarm wrapper for the Bitevachat network.
 //!
 //! [`BitevachatSwarm`] encapsulates the libp2p `Swarm` with the
-//! Bitevachat-specific [`DiscoveryBehaviour`] and provides an async
-//! event loop for connection management and DHT operations.
+//! combined [`BitevachatBehaviour`] and provides an async event loop
+//! for message routing, gossip, and DHT discovery.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use libp2p::swarm::SwarmEvent;
-use libp2p::{identify, kad, noise, tcp, yamux, Multiaddr, PeerId, Swarm};
+use libp2p::gossipsub;
+use libp2p::request_response::{self, ProtocolSupport};
+use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::{identify, kad, noise, yamux, Multiaddr, PeerId, Swarm};
 
 use bitevachat_crypto::signing::Keypair;
-use bitevachat_types::{Address, BitevachatError, Result};
+use bitevachat_protocol::message::MessageEnvelope;
+use bitevachat_protocol::nonce::NonceCache;
+use bitevachat_types::{Address, BitevachatError, MessageId};
+use tokio::sync::mpsc;
 
 use crate::config::NetworkConfig;
 use crate::discovery::{
     build_discovery_behaviour, parse_peer_id_from_record, DiscoveryBehaviour,
     DiscoveryBehaviourEvent,
 };
+use crate::events::NetworkEvent;
+use crate::gossip::{self, subscribe_default_topics};
+use crate::handler::{MessageHandler, DEFAULT_MAX_TIMESTAMP_SKEW_SECS};
 use crate::identity::wallet_keypair_to_libp2p;
+use crate::protocol::{Ack, WireMessage, MSG_PROTOCOL};
+use crate::routing::{build_wire_message, DeliveryStatus, Router};
 use crate::transport;
+
+/// Convenience alias to avoid shadowing `std::result::Result`
+/// which the `#[derive(NetworkBehaviour)]` macro requires.
+type BResult<T> = std::result::Result<T, BitevachatError>;
+
+// ---------------------------------------------------------------------------
+// Combined behaviour
+// ---------------------------------------------------------------------------
+
+/// Combined libp2p behaviour for Bitevachat.
+///
+/// Composes:
+/// - [`DiscoveryBehaviour`] — Kademlia DHT + Identify.
+/// - `cbor::Behaviour<WireMessage, Ack>` — direct messaging via CBOR.
+/// - `gossipsub::Behaviour` — pub/sub for metadata.
+///
+/// The `#[derive(NetworkBehaviour)]` macro auto-generates
+/// `BitevachatBehaviourEvent` with one variant per field.
+#[derive(NetworkBehaviour)]
+pub struct BitevachatBehaviour {
+    /// Kademlia + Identify.
+    pub discovery: DiscoveryBehaviour,
+    /// Direct message send/receive with ACK (CBOR codec).
+    pub messaging: libp2p_request_response::cbor::Behaviour<WireMessage, Ack>,
+    /// Pub/sub for presence and profile updates.
+    pub gossip: gossipsub::Behaviour,
+}
 
 // ---------------------------------------------------------------------------
 // BitevachatSwarm
 // ---------------------------------------------------------------------------
 
-/// High-level wrapper around the libp2p `Swarm<DiscoveryBehaviour>`.
+/// High-level wrapper around `Swarm<BitevachatBehaviour>`.
 ///
-/// Provides a safe async API for starting, connecting, and running
-/// the Bitevachat peer-to-peer network layer.
+/// Provides a safe async API for the full Bitevachat network layer:
+/// message routing with ACK, gossip pub/sub, and DHT discovery.
+///
+/// # Usage
+///
+/// ```ignore
+/// let (mut swarm, event_rx) = BitevachatSwarm::new(config, &wallet_kp).await?;
+/// swarm.start_listening("/ip4/0.0.0.0/tcp/0".parse()?)?;
+/// swarm.run().await;
+/// ```
 pub struct BitevachatSwarm {
     /// The underlying libp2p swarm.
-    swarm: Swarm<DiscoveryBehaviour>,
+    swarm: Swarm<BitevachatBehaviour>,
+    /// Inbound message handler (validation pipeline).
+    handler: MessageHandler,
+    /// Outbound delivery tracker (pending → ACK).
+    router: Router,
+    /// Sender-side event channel (receiver given to caller).
+    event_sender: mpsc::UnboundedSender<NetworkEvent>,
 }
 
 impl BitevachatSwarm {
-    /// Creates a new swarm from a wallet keypair and network config.
+    /// Creates a new swarm with messaging, gossip, and discovery.
     ///
-    /// # Flow
-    ///
-    /// 1. Convert the wallet keypair to a libp2p identity.
-    /// 2. Build TCP + QUIC transport via `SwarmBuilder`.
-    /// 3. Construct the `DiscoveryBehaviour` (Kademlia + Identify).
-    /// 4. Apply connection limits and idle timeout.
-    /// 5. Return the ready-to-use swarm.
+    /// Returns `(swarm, event_receiver)` where `event_receiver` is
+    /// the async channel that delivers all [`NetworkEvent`]s to the
+    /// caller.
     ///
     /// # Errors
     ///
-    /// Returns `BitevachatError::NetworkError` if:
-    /// - The wallet keypair cannot be converted to libp2p identity.
-    /// - The transport or behaviour construction fails.
-    /// - The config validation fails.
+    /// Returns `BitevachatError::NetworkError` if transport, behaviour,
+    /// or identity construction fails.
     pub async fn new(
         config: NetworkConfig,
         wallet_keypair: &Keypair,
-    ) -> Result<Self> {
+    ) -> BResult<(Self, mpsc::UnboundedReceiver<NetworkEvent>)> {
         config.validate()?;
 
-        // 1. Convert wallet identity → libp2p identity
+        // Convert wallet identity → libp2p identity.
         let libp2p_keypair = wallet_keypair_to_libp2p(wallet_keypair)?;
 
-        // 2–3. Build transport + behaviour via SwarmBuilder
+        // Channels for network events.
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+        // Shared nonce cache for replay detection.
+        let nonce_cache = Arc::new(Mutex::new(NonceCache::new(10_000)));
+
+        // Build handler.
+        let handler = MessageHandler::new(
+            Arc::clone(&nonce_cache),
+            DEFAULT_MAX_TIMESTAMP_SKEW_SECS,
+            event_tx.clone(),
+        );
+
+        // Build router.
+        let router = Router::new();
+
+        // Build swarm via SwarmBuilder.
         let config_clone = config.clone();
+        let signing_keypair = libp2p_keypair.clone();
+
         let swarm = libp2p::SwarmBuilder::with_existing_identity(libp2p_keypair)
             .with_tokio()
             .with_tcp(
@@ -74,9 +138,8 @@ impl BitevachatSwarm {
             })?
             .with_quic()
             .with_behaviour(|key| {
-                build_discovery_behaviour(key, &config_clone).map_err(|e| {
-                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                })
+                build_combined_behaviour(key, &config_clone, &signing_keypair)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             })
             .map_err(|e| BitevachatError::NetworkError {
                 reason: format!("failed to build network behaviour: {e}"),
@@ -88,7 +151,14 @@ impl BitevachatSwarm {
             })
             .build();
 
-        Ok(Self { swarm })
+        let me = Self {
+            swarm,
+            handler,
+            router,
+            event_sender: event_tx,
+        };
+
+        Ok((me, event_rx))
     }
 
     /// Returns the local `PeerId` of this swarm.
@@ -106,7 +176,7 @@ impl BitevachatSwarm {
     ///
     /// Returns `BitevachatError::NetworkError` if the address cannot
     /// be bound (e.g. port already in use).
-    pub fn start_listening(&mut self, addr: Multiaddr) -> Result<()> {
+    pub fn start_listening(&mut self, addr: Multiaddr) -> BResult<()> {
         self.swarm
             .listen_on(addr)
             .map_err(|e| BitevachatError::NetworkError {
@@ -125,15 +195,7 @@ impl BitevachatSwarm {
     // -----------------------------------------------------------------------
 
     /// Dials a remote peer at the given multiaddr.
-    ///
-    /// The multiaddr should include a `/p2p/<peer_id>` component for
-    /// identity verification.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BitevachatError::NetworkError` if the dial cannot be
-    /// initiated.
-    pub fn dial_peer(&mut self, addr: Multiaddr) -> Result<()> {
+    pub fn dial_peer(&mut self, addr: Multiaddr) -> BResult<()> {
         self.swarm
             .dial(addr)
             .map_err(|e| BitevachatError::NetworkError {
@@ -146,42 +208,33 @@ impl BitevachatSwarm {
     // -----------------------------------------------------------------------
 
     /// Publishes this node's address → PeerId mapping in the DHT.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BitevachatError::NetworkError` if the DHT put cannot
-    /// be initiated.
     pub fn publish_address(
         &mut self,
         address: &Address,
         peer_id: &PeerId,
-    ) -> Result<kad::QueryId> {
+    ) -> BResult<kad::QueryId> {
         self.swarm
             .behaviour_mut()
+            .discovery
             .publish_address(address, peer_id)
     }
 
     /// Starts a DHT lookup for the PeerId associated with an address.
-    ///
-    /// Results are delivered asynchronously through the event loop.
     pub fn find_peer(&mut self, address: &Address) -> kad::QueryId {
-        self.swarm.behaviour_mut().find_peer(address)
+        self.swarm.behaviour_mut().discovery.find_peer(address)
     }
 
-    /// Adds bootstrap nodes and initiates a Kademlia bootstrap.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BitevachatError::NetworkError` if no valid bootstrap
-    /// nodes were provided or bootstrap cannot start.
-    pub fn bootstrap(&mut self, nodes: &[Multiaddr]) -> Result<()> {
+    /// Adds bootstrap nodes and initiates Kademlia bootstrap.
+    pub fn bootstrap(&mut self, nodes: &[Multiaddr]) -> BResult<()> {
         self.swarm
             .behaviour_mut()
+            .discovery
             .add_bootstrap_nodes(nodes)?;
 
         if !nodes.is_empty() {
             self.swarm
                 .behaviour_mut()
+                .discovery
                 .bootstrap()?;
         }
 
@@ -190,7 +243,63 @@ impl BitevachatSwarm {
 
     /// Sets the Kademlia mode (Client or Server).
     pub fn set_kademlia_mode(&mut self, mode: kad::Mode) {
-        self.swarm.behaviour_mut().set_mode(mode);
+        self.swarm.behaviour_mut().discovery.set_mode(mode);
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct messaging
+    // -----------------------------------------------------------------------
+
+    /// Sends a message to a connected peer via `request_response`.
+    ///
+    /// The message is wrapped in a [`WireMessage`] with the sender's
+    /// public key and tracked by the [`Router`]. The result (ACK or
+    /// failure) is delivered asynchronously as a [`NetworkEvent`].
+    ///
+    /// # Parameters
+    ///
+    /// - `peer_id` — target peer's libp2p PeerId.
+    /// - `envelope` — signed message envelope.
+    /// - `sender_pubkey` — sender's Ed25519 public key (32 bytes).
+    /// - `message_id` — message identifier for tracking.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on successful queueing. The actual delivery result
+    /// arrives later as a `NetworkEvent::DeliveryAck` or
+    /// `NetworkEvent::DeliveryFailed`.
+    pub fn send_message_to_peer(
+        &mut self,
+        peer_id: PeerId,
+        envelope: MessageEnvelope,
+        sender_pubkey: [u8; 32],
+        message_id: MessageId,
+    ) -> BResult<()> {
+        let recipient = envelope.message.recipient.clone();
+        let wire = build_wire_message(envelope.clone(), sender_pubkey);
+
+        let request_id = self
+            .swarm
+            .behaviour_mut()
+            .messaging
+            .send_request(&peer_id, wire);
+
+        self.router.track_send(request_id, message_id, recipient, envelope);
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Gossip
+    // -----------------------------------------------------------------------
+
+    /// Publishes metadata to a gossipsub topic.
+    pub fn publish_gossip(
+        &mut self,
+        topic_name: &str,
+        data: Vec<u8>,
+    ) -> BResult<()> {
+        gossip::publish_metadata(&mut self.swarm.behaviour_mut().gossip, topic_name, data)
     }
 
     // -----------------------------------------------------------------------
@@ -198,12 +307,6 @@ impl BitevachatSwarm {
     // -----------------------------------------------------------------------
 
     /// Runs the swarm event loop, processing all network events.
-    ///
-    /// This is a skeleton implementation that logs events via `tracing`.
-    /// Full protocol handling (message routing, acknowledgements) will
-    /// be added in later stages.
-    ///
-    /// # Cancellation
     ///
     /// This method runs indefinitely. Use `tokio::select!` or task
     /// cancellation to stop it.
@@ -215,11 +318,7 @@ impl BitevachatSwarm {
                     listener_id,
                     address,
                 } => {
-                    tracing::info!(
-                        %address,
-                        ?listener_id,
-                        "new listen address"
-                    );
+                    tracing::info!(%address, ?listener_id, "new listen address");
                 }
 
                 SwarmEvent::ConnectionEstablished {
@@ -234,6 +333,9 @@ impl BitevachatSwarm {
                         num_established,
                         "connection established"
                     );
+                    let _ = self
+                        .event_sender
+                        .send(NetworkEvent::PeerConnected(peer_id));
                 }
 
                 SwarmEvent::ConnectionClosed {
@@ -242,20 +344,16 @@ impl BitevachatSwarm {
                     num_established,
                     ..
                 } => {
-                    tracing::info!(
-                        %peer_id,
-                        ?cause,
-                        num_established,
-                        "connection closed"
-                    );
+                    tracing::info!(%peer_id, ?cause, num_established, "connection closed");
+                    if num_established == 0 {
+                        let _ = self
+                            .event_sender
+                            .send(NetworkEvent::PeerDisconnected(peer_id));
+                    }
                 }
 
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                    tracing::warn!(
-                        ?peer_id,
-                        %error,
-                        "outgoing connection error"
-                    );
+                    tracing::warn!(?peer_id, %error, "outgoing connection error");
                 }
 
                 SwarmEvent::IncomingConnectionError {
@@ -274,23 +372,162 @@ impl BitevachatSwarm {
 
                 // --- Behaviour events -------------------------------------
                 SwarmEvent::Behaviour(event) => {
-                    handle_behaviour_event(event);
+                    self.handle_behaviour_event(event).await;
                 }
 
-                // --- Catch-all for other swarm events ---------------------
+                // --- Catch-all --------------------------------------------
                 other => {
                     tracing::trace!(?other, "unhandled swarm event");
                 }
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Internal event dispatch
+    // -----------------------------------------------------------------------
+
+    async fn handle_behaviour_event(&mut self, event: BitevachatBehaviourEvent) {
+        match event {
+            BitevachatBehaviourEvent::Discovery(disc) => {
+                handle_discovery_event(disc);
+            }
+            BitevachatBehaviourEvent::Messaging(msg_event) => {
+                self.handle_messaging_event(msg_event).await;
+            }
+            BitevachatBehaviourEvent::Gossip(gossip_event) => {
+                self.handle_gossip_event(gossip_event);
+            }
+        }
+    }
+
+    /// Handles request_response events for direct messaging.
+    async fn handle_messaging_event(
+        &mut self,
+        event: request_response::Event<WireMessage, Ack>,
+    ) {
+        match event {
+            // --- Inbound request: validate and respond with ACK ---
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+            } => {
+                let wire: WireMessage = request;
+                let result = self
+                    .handler
+                    .on_message_received(peer, wire.envelope, &wire.sender_pubkey)
+                    .await;
+
+                // Send the ACK back through the response channel.
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .messaging
+                    .send_response(channel, result.ack.clone())
+                    .is_err()
+                {
+                    tracing::warn!(%peer, "failed to send ACK (channel closed)");
+                }
+            }
+
+            // --- Outbound response: ACK received from remote ---
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+            } => {
+                if let Some((msg_id, status)) =
+                    self.router.on_ack_received(&request_id, &response)
+                {
+                    match status {
+                        DeliveryStatus::Delivered => {
+                            tracing::info!(?msg_id, %peer, "message delivered (ACK Ok)");
+                            let _ = self
+                                .event_sender
+                                .send(NetworkEvent::DeliveryAck(msg_id));
+                        }
+                        DeliveryStatus::Failed => {
+                            tracing::warn!(?msg_id, %peer, ?response, "message rejected by peer");
+                            let _ = self
+                                .event_sender
+                                .send(NetworkEvent::DeliveryFailed(msg_id));
+                        }
+                        DeliveryStatus::Queued => {
+                            // Should not occur for an ACK, but handle gracefully.
+                            tracing::debug!(?msg_id, "unexpected Queued status on ACK");
+                        }
+                    }
+                }
+            }
+
+            // --- Outbound failure: send failed ---
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            } => {
+                tracing::warn!(%peer, ?error, "outbound message delivery failed");
+                if let Some(pending) = self.router.on_send_failed(&request_id) {
+                    let _ = self
+                        .event_sender
+                        .send(NetworkEvent::DeliveryFailed(pending.message_id));
+                }
+            }
+
+            // --- Inbound failure: handler error ---
+            request_response::Event::InboundFailure {
+                peer,
+                error,
+                ..
+            } => {
+                tracing::warn!(%peer, ?error, "inbound message handling failed");
+            }
+
+            // --- Response sent confirmation ---
+            request_response::Event::ResponseSent { peer, .. } => {
+                tracing::trace!(%peer, "ACK response sent");
+            }
+        }
+    }
+
+    /// Handles gossipsub events.
+    fn handle_gossip_event(&self, event: gossipsub::Event) {
+        match event {
+            gossipsub::Event::Message {
+                propagation_source,
+                message,
+                ..
+            } => {
+                let _ = self.event_sender.send(NetworkEvent::GossipMessage {
+                    source: propagation_source,
+                    topic: message.topic.to_string(),
+                    data: message.data,
+                });
+            }
+            gossipsub::Event::Subscribed { peer_id, topic } => {
+                tracing::debug!(%peer_id, %topic, "peer subscribed to topic");
+            }
+            gossipsub::Event::Unsubscribed { peer_id, topic } => {
+                tracing::debug!(%peer_id, %topic, "peer unsubscribed from topic");
+            }
+            gossipsub::Event::GossipsubNotSupported { peer_id } => {
+                tracing::trace!(%peer_id, "gossipsub not supported by peer");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Event handlers (skeleton — logging only)
+// Discovery event handlers (logging)
 // ---------------------------------------------------------------------------
 
-fn handle_behaviour_event(event: DiscoveryBehaviourEvent) {
+fn handle_discovery_event(event: DiscoveryBehaviourEvent) {
     match event {
         DiscoveryBehaviourEvent::Kademlia(kad_event) => {
             handle_kademlia_event(kad_event);
@@ -308,24 +545,14 @@ fn handle_kademlia_event(event: kad::Event) {
         } => match result {
             kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
                 kad::PeerRecord { record, .. },
-            ))) => {
-                match parse_peer_id_from_record(&record.value) {
-                    Ok(peer_id) => {
-                        tracing::info!(
-                            ?id,
-                            %peer_id,
-                            "DHT get_record succeeded: found peer"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            ?id,
-                            %e,
-                            "DHT get_record returned unparseable value"
-                        );
-                    }
+            ))) => match parse_peer_id_from_record(&record.value) {
+                Ok(peer_id) => {
+                    tracing::info!(?id, %peer_id, "DHT get_record succeeded");
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(?id, %e, "DHT get_record returned unparseable value");
+                }
+            },
             kad::QueryResult::GetRecord(Ok(
                 kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. },
             )) => {
@@ -344,22 +571,13 @@ fn handle_kademlia_event(event: kad::Event) {
                 peer,
                 num_remaining,
             })) => {
-                tracing::info!(
-                    ?id,
-                    %peer,
-                    num_remaining,
-                    "Kademlia bootstrap progress"
-                );
+                tracing::info!(?id, %peer, num_remaining, "Kademlia bootstrap progress");
             }
             kad::QueryResult::Bootstrap(Err(e)) => {
                 tracing::warn!(?id, ?e, "Kademlia bootstrap failed");
             }
             kad::QueryResult::GetClosestPeers(Ok(ok)) => {
-                tracing::debug!(
-                    ?id,
-                    peers = ?ok.peers,
-                    "get_closest_peers result"
-                );
+                tracing::debug!(?id, peers = ?ok.peers, "get_closest_peers result");
             }
             kad::QueryResult::GetClosestPeers(Err(e)) => {
                 tracing::warn!(?id, ?e, "get_closest_peers failed");
@@ -407,4 +625,34 @@ fn handle_identify_event(event: identify::Event) {
             tracing::warn!(%peer_id, %error, "identify: error");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Behaviour construction
+// ---------------------------------------------------------------------------
+
+/// Builds the combined [`BitevachatBehaviour`].
+fn build_combined_behaviour(
+    key: &libp2p::identity::Keypair,
+    config: &NetworkConfig,
+    signing_keypair: &libp2p::identity::Keypair,
+) -> BResult<BitevachatBehaviour> {
+    let discovery = build_discovery_behaviour(key, config)?;
+
+    // Use the built-in CBOR codec from libp2p-request-response.
+    // Behaviour::new creates a default cbor::Codec internally;
+    // WireMessage/Ack implement Serialize + Deserialize via serde.
+    let messaging = libp2p_request_response::cbor::Behaviour::<WireMessage, Ack>::new(
+        [(MSG_PROTOCOL, ProtocolSupport::Full)],
+        request_response::Config::default(),
+    );
+
+    let mut gossip_beh = gossip::build_gossip_behaviour(signing_keypair)?;
+    subscribe_default_topics(&mut gossip_beh)?;
+
+    Ok(BitevachatBehaviour {
+        discovery,
+        messaging,
+        gossip: gossip_beh,
+    })
 }

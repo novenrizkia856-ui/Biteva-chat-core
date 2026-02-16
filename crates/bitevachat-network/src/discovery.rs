@@ -24,8 +24,8 @@ use bitevachat_types::{Address, BitevachatError};
 
 use crate::config::NetworkConfig;
 
-/// Alias to avoid shadowing `std::result::Result` which the
-/// `#[derive(NetworkBehaviour)]` macro needs unqualified.
+/// Local alias so we never shadow `std::result::Result` (which the
+/// `#[derive(NetworkBehaviour)]` macro needs).
 type BResult<T> = std::result::Result<T, BitevachatError>;
 
 // ---------------------------------------------------------------------------
@@ -77,10 +77,11 @@ pub fn build_discovery_behaviour(
         },
     )?;
 
-    let mut kad_config = kad::Config::default();
+    // Use Config::new(protocol) which replaces the deprecated
+    // Config::default() + set_protocol_names() pattern.
+    let mut kad_config = kad::Config::new(protocol);
     kad_config.set_query_timeout(Duration::from_secs(config.kad_query_timeout_secs));
     kad_config.set_replication_factor(replication_factor);
-    kad_config.set_protocol_names(vec![protocol]);
 
     let store = kad::store::MemoryStore::new(local_peer_id);
     let kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
@@ -225,11 +226,11 @@ impl DiscoveryBehaviour {
 ///
 /// Returns `None` if the multiaddr does not contain a `/p2p/` component.
 fn extract_peer_id(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
-    let mut components = addr.iter().peekable();
+    let components = addr.iter();
     let mut clean_addr = Multiaddr::empty();
     let mut peer_id = None;
 
-    while let Some(proto) = components.next() {
+    for proto in components {
         match proto {
             libp2p::multiaddr::Protocol::P2p(id) => {
                 peer_id = Some(id);
@@ -268,7 +269,6 @@ mod tests {
 
     #[test]
     fn extract_peer_id_with_p2p_component() {
-        // Use a well-known test PeerId format
         let keypair = identity::Keypair::generate_ed25519();
         let peer_id = PeerId::from(keypair.public());
         let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/4001/p2p/{peer_id}")
