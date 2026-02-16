@@ -113,6 +113,7 @@ pub(crate) struct NodeRuntime {
     pub shutdown_rx: watch::Receiver<bool>,
     pub pending_tick_secs: u64,
     pub maintenance_tick_secs: u64,
+    pub spam_filter: crate::spam_filter::SpamFilter,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +217,10 @@ impl Node {
 
         let listen_addr = net_config.listen_addr.clone();
 
+        // Initialize anti-spam filter from config.
+        let spam_config = crate::spam_filter::SpamConfig::from(&app_config);
+        let spam_filter = crate::spam_filter::SpamFilter::new(spam_config);
+
         let runtime = NodeRuntime {
             wallet,
             storage,
@@ -230,6 +235,7 @@ impl Node {
             shutdown_rx,
             pending_tick_secs: PENDING_TICK_SECS,
             maintenance_tick_secs: MAINTENANCE_TICK_SECS,
+            spam_filter,
         };
 
         Ok(Self {

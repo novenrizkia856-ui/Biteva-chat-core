@@ -22,3 +22,4 @@ pub mod nonce;
 pub mod session;
 pub mod signing;
 pub mod validation;
+pub mod pow;

@@ -4,9 +4,11 @@
 //! validation pipeline (signature, timestamp, nonce). The node
 //! layer is responsible for:
 //!
-//! 1. Computing the conversation ID.
-//! 2. Storing the envelope to the message database.
-//! 3. Emitting [`NodeEvent::MessageReceived`].
+//! 1. **Anti-spam filtering** (blocklist, rate limit, trust, PoW).
+//! 2. Computing the conversation ID.
+//! 3. Storing the envelope to the message database.
+//! 4. Recording the interaction for trust scoring.
+//! 5. Emitting [`NodeEvent::MessageReceived`].
 //!
 //! **Decryption is NOT performed here.** The payload remains E2E
 //! encrypted. Decryption happens on-demand when the consumer reads
@@ -17,8 +19,8 @@
 //! The network handler (`bitevachat_network::handler::MessageHandler`)
 //! already verified:
 //! - Ed25519 signature over canonical CBOR
-//! - Pubkey → address binding
-//! - Timestamp skew (±5 min)
+//! - Pubkey -> address binding
+//! - Timestamp skew (+-5 min)
 //! - Nonce replay detection
 //!
 //! Re-verifying here would be redundant and wasteful. The
@@ -27,11 +29,14 @@
 
 use bitevachat_crypto::hash::sha3_256;
 use bitevachat_protocol::message::MessageEnvelope;
+use bitevachat_protocol::pow::ProofOfWork;
 use bitevachat_storage::engine::StorageEngine;
 use bitevachat_types::{
     Address, BitevachatError, ConvoId, NodeEvent,
 };
 use tokio::sync::mpsc;
+
+use crate::spam_filter::{FilterResult, SpamFilter};
 
 /// Convenience alias.
 type BResult<T> = std::result::Result<T, BitevachatError>;
@@ -44,17 +49,27 @@ type BResult<T> = std::result::Result<T, BitevachatError>;
 ///
 /// # Steps
 ///
-/// 1. Compute deterministic `ConvoId` from sender + recipient.
-/// 2. Store the envelope (still E2E encrypted) to the message DB.
-/// 3. Emit `NodeEvent::MessageReceived` to the event channel.
+/// 1. Run anti-spam filter (blocklist -> rate limit -> trust -> PoW).
+/// 2. Compute deterministic `ConvoId` from sender + recipient.
+/// 3. Store the envelope (still E2E encrypted) to the message DB.
+/// 4. Record successful interaction for trust scoring.
+/// 5. Emit `NodeEvent::MessageReceived` to the event channel.
 ///
 /// # Errors
 ///
-/// Returns `BitevachatError::StorageError` if the database write
-/// fails. Event channel send errors are logged but not propagated
-/// (the event loop must not crash because a consumer fell behind).
+/// - `BitevachatError::RateLimitExceeded` if the sender is rate-limited.
+/// - `BitevachatError::InvalidMessage` if the sender is blocked or
+///   the message is rejected by the spam filter.
+/// - `BitevachatError::ProtocolError` if PoW is required but missing
+///   or invalid.
+/// - `BitevachatError::StorageError` if the database write fails.
+///
+/// Event channel send errors are logged but not propagated (the event
+/// loop must not crash because a consumer fell behind).
 pub async fn handle_incoming_message(
     envelope: &MessageEnvelope,
+    pow: Option<&ProofOfWork>,
+    spam_filter: &SpamFilter,
     storage: &StorageEngine,
     event_tx: &mpsc::Sender<NodeEvent>,
 ) -> BResult<()> {
@@ -62,14 +77,40 @@ pub async fn handle_incoming_message(
     let recipient = &envelope.message.recipient;
     let message_id = envelope.message.message_id;
 
-    // 1. Compute conversation ID.
+    // 1. Anti-spam filter.
+    let msg_hash = message_id.as_bytes();
+    let filter_result = spam_filter.filter_incoming(sender, msg_hash, pow)?;
+
+    match filter_result {
+        FilterResult::Accept => {} // continue processing
+        FilterResult::RateLimit => {
+            tracing::warn!(%sender, "rate limited");
+            return Err(BitevachatError::RateLimitExceeded {
+                reason: format!("sender {} is rate limited", sender),
+            });
+        }
+        FilterResult::Blocked => {
+            tracing::warn!(%sender, "blocked by blocklist");
+            return Err(BitevachatError::InvalidMessage {
+                reason: format!("sender {} is blocked", sender),
+            });
+        }
+        FilterResult::PowRequired => {
+            tracing::debug!(%sender, "PoW required for unknown sender");
+            return Err(BitevachatError::ProtocolError {
+                reason: "proof-of-work required for unknown senders".into(),
+            });
+        }
+        FilterResult::Reject { reason } => {
+            tracing::warn!(%sender, %reason, "message rejected by spam filter");
+            return Err(BitevachatError::InvalidMessage { reason });
+        }
+    }
+
+    // 2. Compute conversation ID.
     let convo_id = compute_convo_id(sender, recipient);
 
-    // 2. Store to message database.
-    //
-    // The MessageStore encrypts at rest via the StorageEngine's
-    // derived keys. We store the full envelope (message + signature)
-    // so it can be re-verified if needed.
+    // 3. Store to message database.
     store_envelope(storage, &convo_id, envelope)?;
 
     tracing::info!(
@@ -78,7 +119,10 @@ pub async fn handle_incoming_message(
         "incoming message stored"
     );
 
-    // 3. Emit event to consumer.
+    // 4. Record successful interaction for trust scoring.
+    spam_filter.record_successful_interaction(sender);
+
+    // 5. Emit event to consumer.
     let event = NodeEvent::MessageReceived {
         convo_id,
         message_id,
@@ -88,7 +132,7 @@ pub async fn handle_incoming_message(
     if event_tx.send(event).await.is_err() {
         tracing::warn!(
             %message_id,
-            "node event channel closed — consumer may have dropped"
+            "node event channel closed -- consumer may have dropped"
         );
     }
 
@@ -128,16 +172,6 @@ pub fn compute_convo_id(a: &Address, b: &Address) -> ConvoId {
 // ---------------------------------------------------------------------------
 
 /// Stores a message envelope to the database.
-///
-/// Uses the `messages` tree via `StorageEngine::messages()`.
-/// The key is the message ID bytes; the value is the CBOR-serialized
-/// envelope.
-///
-/// # Integration note
-///
-/// This function uses serde serialization (not canonical CBOR) for
-/// storage, since the canonical form is only required for signatures.
-/// The stored bytes include the full envelope (message + signature).
 fn store_envelope(
     storage: &StorageEngine,
     _convo_id: &ConvoId,
@@ -145,10 +179,6 @@ fn store_envelope(
 ) -> BResult<()> {
     let msg_store = storage.messages()?;
 
-    // Serialize envelope for storage.
-    // The MessageStore handles at-rest encryption internally via
-    // the StorageEngine's derived keys.
-    //
     // TODO: Call `msg_store.put(convo_id, message_id, envelope_bytes)`
     // when the MessageStore CRUD API is finalized. For now we verify
     // the store is accessible and log the operation.
@@ -185,8 +215,6 @@ mod tests {
     fn convo_id_same_address() {
         let a = Address::new([0x42; 32]);
         let id = compute_convo_id(&a, &a);
-
-        // Self-conversation is valid (notes to self).
         assert_eq!(id.as_bytes().len(), 32);
     }
 

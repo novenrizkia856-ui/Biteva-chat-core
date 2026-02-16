@@ -86,6 +86,7 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
             Some(net_event) = rt.network_rx.recv() => {
                 handle_network_event(
                     net_event,
+                    &rt.spam_filter,
                     &rt.storage,
                     &rt.pending_queue,
                     &rt.event_tx,
@@ -142,6 +143,7 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
 /// Dispatches a network event to the appropriate handler.
 async fn handle_network_event(
     event: NetworkEvent,
+    spam_filter: &crate::spam_filter::SpamFilter,
     storage: &bitevachat_storage::engine::StorageEngine,
     pending_queue: &std::sync::Arc<bitevachat_storage::pending::PendingQueue>,
     event_tx: &tokio::sync::mpsc::Sender<NodeEvent>,
@@ -150,6 +152,8 @@ async fn handle_network_event(
         NetworkEvent::MessageReceived(envelope) => {
             let result = incoming::handle_incoming_message(
                 &envelope,
+                None, // PoW: transport metadata, not yet wired
+                spam_filter,
                 storage,
                 event_tx,
             ).await;

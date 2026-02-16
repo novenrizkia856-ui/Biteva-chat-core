@@ -31,6 +31,30 @@ pub struct AppConfig {
     /// Size of the nonce replay cache (number of recent nonces tracked).
     /// Used to detect and reject replayed messages.
     pub nonce_cache_size: usize,
+
+    // ----- Anti-spam settings ---------------------------------------------
+
+    /// Proof-of-work difficulty in leading zero bits.
+    ///
+    /// Required for senders with `Unknown` trust level. Capped at
+    /// [`bitevachat_protocol::pow::MAX_DIFFICULTY`] (24).
+    pub pow_difficulty: u8,
+
+    /// Whether proof-of-work is required for unknown senders.
+    ///
+    /// When `false`, PoW checks are skipped entirely.
+    pub enable_pow: bool,
+
+    /// Number of successful interactions required for trust promotion.
+    ///
+    /// - `Unknown` → `Seen`: `trust_threshold` interactions.
+    /// - `Seen` → `Trusted`: `trust_threshold * 3` interactions.
+    pub trust_threshold: u32,
+
+    /// Whether the system-level blocklist is enabled.
+    ///
+    /// When `false`, blocklist checks are skipped (all senders pass).
+    pub blocklist_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -41,6 +65,10 @@ impl Default for AppConfig {
             rate_limit_per_min: 10,
             pending_max: 500,
             nonce_cache_size: 10_000,
+            pow_difficulty: 8,
+            enable_pow: true,
+            trust_threshold: 3,
+            blocklist_enabled: true,
         }
     }
 }
@@ -80,6 +108,18 @@ impl AppConfig {
             });
         }
 
+        if self.pow_difficulty > 24 {
+            return Err(BitevachatError::ConfigError {
+                reason: "pow_difficulty must be 0..=24".into(),
+            });
+        }
+
+        if self.trust_threshold == 0 {
+            return Err(BitevachatError::ConfigError {
+                reason: "trust_threshold must be greater than 0".into(),
+            });
+        }
+
         Ok(())
     }
 }
@@ -102,6 +142,10 @@ mod tests {
         assert_eq!(config.rate_limit_per_min, 10);
         assert_eq!(config.pending_max, 500);
         assert_eq!(config.nonce_cache_size, 10_000);
+        assert_eq!(config.pow_difficulty, 8);
+        assert!(config.enable_pow);
+        assert_eq!(config.trust_threshold, 3);
+        assert!(config.blocklist_enabled);
     }
 
     #[test]
@@ -150,6 +194,42 @@ mod tests {
     }
 
     #[test]
+    fn pow_difficulty_exceeds_max_rejected() {
+        let config = AppConfig {
+            pow_difficulty: 25,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn zero_trust_threshold_rejected() {
+        let config = AppConfig {
+            trust_threshold: 0,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn pow_disabled_is_valid() {
+        let config = AppConfig {
+            enable_pow: false,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn blocklist_disabled_is_valid() {
+        let config = AppConfig {
+            blocklist_enabled: false,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn config_serde_roundtrip() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let config = AppConfig::default();
         let json = serde_json::to_string(&config)?;
@@ -159,6 +239,10 @@ mod tests {
         assert_eq!(config.rate_limit_per_min, parsed.rate_limit_per_min);
         assert_eq!(config.pending_max, parsed.pending_max);
         assert_eq!(config.nonce_cache_size, parsed.nonce_cache_size);
+        assert_eq!(config.pow_difficulty, parsed.pow_difficulty);
+        assert_eq!(config.enable_pow, parsed.enable_pow);
+        assert_eq!(config.trust_threshold, parsed.trust_threshold);
+        assert_eq!(config.blocklist_enabled, parsed.blocklist_enabled);
         Ok(())
     }
 }
