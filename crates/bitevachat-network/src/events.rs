@@ -8,6 +8,8 @@ use bitevachat_protocol::message::MessageEnvelope;
 use bitevachat_types::MessageId;
 use libp2p::PeerId;
 
+use crate::nat::NatStatus;
+
 // ---------------------------------------------------------------------------
 // NetworkEvent
 // ---------------------------------------------------------------------------
@@ -46,4 +48,16 @@ pub enum NetworkEvent {
         /// Raw payload bytes.
         data: Vec<u8>,
     },
+
+    /// The observed NAT status changed.
+    ///
+    /// Emitted when AutoNAT detects a change in reachability.
+    /// Higher layers can use this to adjust behaviour (e.g. switch
+    /// to relay mode, update advertised addresses).
+    NatStatusChanged(NatStatus),
+
+    /// A DCUtR direct connection upgrade (hole punch) succeeded.
+    ///
+    /// The relay circuit has been replaced with a direct connection.
+    HolePunchSucceeded(PeerId),
 }

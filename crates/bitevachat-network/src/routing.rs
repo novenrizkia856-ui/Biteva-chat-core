@@ -10,6 +10,15 @@
 //! The router does NOT perform blocking waits; it initiates
 //! operations and the swarm event loop drives completion by
 //! calling [`Router::on_ack_received`] and [`Router::on_send_failed`].
+//!
+//! # Fallback chain
+//!
+//! When a direct send fails and relay servers are available, the
+//! swarm can retry via relay. The fallback order is:
+//!
+//! 1. Direct dial (skipped in relay-only mode)
+//! 2. Relay circuit (DCUtR upgrades automatically)
+//! 3. TURN (stub — always fails)
 
 use std::collections::HashMap;
 
@@ -18,6 +27,7 @@ use bitevachat_types::{Address, BitevachatError, MessageId};
 use libp2p::request_response;
 use libp2p::PeerId;
 
+use crate::hole_punch::ConnectionStrategy;
 use crate::protocol::{Ack, WireMessage};
 
 // ---------------------------------------------------------------------------
@@ -50,6 +60,8 @@ pub struct PendingSend {
     pub recipient: Address,
     /// The original envelope (for re-queue on failure).
     pub envelope: MessageEnvelope,
+    /// The strategy used for this attempt.
+    pub strategy: ConnectionStrategy,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +96,24 @@ impl Router {
         recipient: Address,
         envelope: MessageEnvelope,
     ) {
+        self.track_send_with_strategy(
+            request_id,
+            message_id,
+            recipient,
+            envelope,
+            ConnectionStrategy::Direct,
+        );
+    }
+
+    /// Registers an in-flight send with an explicit connection strategy.
+    pub fn track_send_with_strategy(
+        &mut self,
+        request_id: request_response::OutboundRequestId,
+        message_id: MessageId,
+        recipient: Address,
+        envelope: MessageEnvelope,
+        strategy: ConnectionStrategy,
+    ) {
         self.pending.insert(
             request_id,
             PendingSend {
@@ -91,6 +121,7 @@ impl Router {
                 message_id,
                 recipient,
                 envelope,
+                strategy,
             },
         );
     }
@@ -112,6 +143,7 @@ impl Router {
                 tracing::warn!(
                     msg_id = %entry.message_id,
                     ack = ?ack,
+                    strategy = %entry.strategy,
                     "recipient rejected message"
                 );
                 DeliveryStatus::Failed
@@ -123,7 +155,8 @@ impl Router {
 
     /// Processes a send failure (dial error, timeout, stream error).
     ///
-    /// Returns the pending send so the caller can enqueue it for retry.
+    /// Returns the pending send so the caller can enqueue it for
+    /// retry with an alternative strategy.
     pub fn on_send_failed(
         &mut self,
         request_id: &request_response::OutboundRequestId,
@@ -172,7 +205,7 @@ mod tests {
     #[test]
     fn router_tracks_and_resolves_send() {
         let mut router = Router::new();
-        let msg_id = MessageId::new([0x01; 32]);
+        let _msg_id = MessageId::new([0x01; 32]);
 
         // We can't construct a real OutboundRequestId (it's opaque),
         // so we just verify the router is constructable and default
@@ -185,5 +218,11 @@ mod tests {
         assert_eq!(DeliveryStatus::Delivered, DeliveryStatus::Delivered);
         assert_ne!(DeliveryStatus::Delivered, DeliveryStatus::Queued);
         assert_ne!(DeliveryStatus::Queued, DeliveryStatus::Failed);
+    }
+
+    #[test]
+    fn default_router_is_empty() {
+        let router = Router::default();
+        assert_eq!(router.pending_count(), 0);
     }
 }

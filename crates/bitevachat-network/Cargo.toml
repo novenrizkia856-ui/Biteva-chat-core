@@ -4,10 +4,10 @@ edition.workspace = true
 version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "libp2p network layer for Bitevachat: identity, transport, discovery, messaging, gossip"
+description = "libp2p network layer for Bitevachat: identity, transport, discovery, messaging, gossip, NAT traversal"
 
 [dependencies]
-# --- libp2p: features for transport, discovery, messaging, gossip ---
+# --- libp2p: features for transport, discovery, messaging, gossip, NAT ---
 libp2p = { version = "0.54", features = [
     "tokio",
     "tcp",
@@ -19,6 +19,9 @@ libp2p = { version = "0.54", features = [
     "request-response",
     "gossipsub",
     "macros",
+    "autonat",
+    "relay",
+    "dcutr",
 ] }
 
 # --- request-response with built-in CBOR codec (serde-based) ---

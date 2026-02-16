@@ -2,14 +2,18 @@
 //!
 //! [`BitevachatSwarm`] encapsulates the libp2p `Swarm` with the
 //! combined [`BitevachatBehaviour`] and provides an async event loop
-//! for message routing, gossip, and DHT discovery.
+//! for message routing, gossip, DHT discovery, and NAT traversal.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
+use libp2p::autonat;
+use libp2p::dcutr;
 use libp2p::gossipsub;
+use libp2p::relay;
 use libp2p::request_response::{self, ProtocolSupport};
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, kad, noise, yamux, Multiaddr, PeerId, Swarm};
 
@@ -27,8 +31,11 @@ use crate::discovery::{
 use crate::events::NetworkEvent;
 use crate::gossip::{self, subscribe_default_topics};
 use crate::handler::{MessageHandler, DEFAULT_MAX_TIMESTAMP_SKEW_SECS};
+use crate::hole_punch;
 use crate::identity::wallet_keypair_to_libp2p;
+use crate::nat::{self, NatManager};
 use crate::protocol::{Ack, WireMessage, MSG_PROTOCOL};
+use crate::relay as relay_mod;
 use crate::routing::{build_wire_message, DeliveryStatus, Router};
 use crate::transport;
 
@@ -46,6 +53,10 @@ type BResult<T> = std::result::Result<T, BitevachatError>;
 /// - [`DiscoveryBehaviour`] — Kademlia DHT + Identify.
 /// - `cbor::Behaviour<WireMessage, Ack>` — direct messaging via CBOR.
 /// - `gossipsub::Behaviour` — pub/sub for metadata.
+/// - `autonat::Behaviour` — NAT status detection.
+/// - `relay::client::Behaviour` — relay client for NAT traversal.
+/// - `dcutr::Behaviour` — Direct Connection Upgrade through Relay.
+/// - `Toggle<relay::Behaviour>` — optional relay server.
 ///
 /// The `#[derive(NetworkBehaviour)]` macro auto-generates
 /// `BitevachatBehaviourEvent` with one variant per field.
@@ -57,6 +68,14 @@ pub struct BitevachatBehaviour {
     pub messaging: libp2p_request_response::cbor::Behaviour<WireMessage, Ack>,
     /// Pub/sub for presence and profile updates.
     pub gossip: gossipsub::Behaviour,
+    /// NAT status detection via AutoNAT probes.
+    pub autonat: autonat::Behaviour,
+    /// Relay client for connecting through relay nodes.
+    pub relay_client: relay::client::Behaviour,
+    /// DCUtR hole punching (automatic relay → direct upgrade).
+    pub dcutr: dcutr::Behaviour,
+    /// Optional relay server (serves as relay for other peers).
+    pub relay_server: Toggle<relay::Behaviour>,
 }
 
 // ---------------------------------------------------------------------------
@@ -66,7 +85,8 @@ pub struct BitevachatBehaviour {
 /// High-level wrapper around `Swarm<BitevachatBehaviour>`.
 ///
 /// Provides a safe async API for the full Bitevachat network layer:
-/// message routing with ACK, gossip pub/sub, and DHT discovery.
+/// message routing with ACK, gossip pub/sub, DHT discovery, and
+/// NAT traversal with automatic fallback.
 ///
 /// # Usage
 ///
@@ -84,10 +104,15 @@ pub struct BitevachatSwarm {
     router: Router,
     /// Sender-side event channel (receiver given to caller).
     event_sender: mpsc::UnboundedSender<NetworkEvent>,
+    /// NAT status manager.
+    nat_manager: NatManager,
+    /// Whether relay-only mode is active.
+    relay_only: bool,
 }
 
 impl BitevachatSwarm {
-    /// Creates a new swarm with messaging, gossip, and discovery.
+    /// Creates a new swarm with messaging, gossip, discovery, and
+    /// NAT traversal.
     ///
     /// Returns `(swarm, event_receiver)` where `event_receiver` is
     /// the async channel that delivers all [`NetworkEvent`]s to the
@@ -122,10 +147,12 @@ impl BitevachatSwarm {
         // Build router.
         let router = Router::new();
 
-        // Build swarm via SwarmBuilder.
+        // Capture config for the behaviour closure.
         let config_clone = config.clone();
         let signing_keypair = libp2p_keypair.clone();
+        let relay_only = config.relay_only;
 
+        // Build swarm via SwarmBuilder with relay client transport.
         let swarm = libp2p::SwarmBuilder::with_existing_identity(libp2p_keypair)
             .with_tokio()
             .with_tcp(
@@ -137,9 +164,18 @@ impl BitevachatSwarm {
                 reason: format!("failed to configure TCP transport: {e}"),
             })?
             .with_quic()
-            .with_behaviour(|key| {
-                build_combined_behaviour(key, &config_clone, &signing_keypair)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|e| BitevachatError::NetworkError {
+                reason: format!("failed to configure relay client transport: {e}"),
+            })?
+            .with_behaviour(|key, relay_client| {
+                build_combined_behaviour(
+                    key,
+                    &config_clone,
+                    &signing_keypair,
+                    relay_client,
+                )
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             })
             .map_err(|e| BitevachatError::NetworkError {
                 reason: format!("failed to build network behaviour: {e}"),
@@ -156,6 +192,8 @@ impl BitevachatSwarm {
             handler,
             router,
             event_sender: event_tx,
+            nat_manager: NatManager::new(),
+            relay_only,
         };
 
         Ok((me, event_rx))
@@ -164,6 +202,21 @@ impl BitevachatSwarm {
     /// Returns the local `PeerId` of this swarm.
     pub fn local_peer_id(&self) -> &PeerId {
         self.swarm.local_peer_id()
+    }
+
+    /// Returns the current NAT status.
+    pub fn nat_status(&self) -> &nat::NatStatus {
+        self.nat_manager.current_status()
+    }
+
+    /// Returns the discovered external address, if any.
+    pub fn external_address(&self) -> Option<&Multiaddr> {
+        self.nat_manager.external_address()
+    }
+
+    /// Returns whether relay-only mode is active.
+    pub fn is_relay_only(&self) -> bool {
+        self.relay_only
     }
 
     // -----------------------------------------------------------------------
@@ -190,16 +243,86 @@ impl BitevachatSwarm {
         self.swarm.listeners().cloned().collect()
     }
 
+    /// Starts listening on a relay circuit address.
+    ///
+    /// This makes the node reachable through the relay for peers
+    /// that cannot connect directly. The relay must be connected
+    /// first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BitevachatError::NetworkError` if the relay listen
+    /// address cannot be constructed or bound.
+    pub fn listen_on_relay(
+        &mut self,
+        relay_addr: &Multiaddr,
+        relay_peer_id: &PeerId,
+    ) -> BResult<()> {
+        let listen_addr =
+            relay_mod::build_relay_listen_addr(relay_addr, relay_peer_id)?;
+
+        self.swarm
+            .listen_on(listen_addr)
+            .map_err(|e| BitevachatError::NetworkError {
+                reason: format!("failed to listen on relay: {e}"),
+            })?;
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Dialing
     // -----------------------------------------------------------------------
 
     /// Dials a remote peer at the given multiaddr.
+    ///
+    /// In relay-only mode, this method rejects direct addresses and
+    /// only accepts relay circuit addresses.
     pub fn dial_peer(&mut self, addr: Multiaddr) -> BResult<()> {
+        if self.relay_only {
+            let addr_str = addr.to_string();
+            if !addr_str.contains("p2p-circuit") {
+                return Err(BitevachatError::NetworkError {
+                    reason: "relay-only mode: direct dial disabled; \
+                             use a relay circuit address"
+                        .into(),
+                });
+            }
+        }
+
         self.swarm
             .dial(addr)
             .map_err(|e| BitevachatError::NetworkError {
                 reason: format!("failed to dial peer: {e}"),
+            })
+    }
+
+    /// Dials a peer through a relay circuit.
+    ///
+    /// Constructs a circuit address and dials it. DCUtR will
+    /// automatically attempt to upgrade to a direct connection.
+    pub fn dial_via_relay(
+        &mut self,
+        relay_addr: &Multiaddr,
+        relay_peer_id: &PeerId,
+        target_peer_id: &PeerId,
+    ) -> BResult<()> {
+        let circuit_addr = relay_mod::build_relay_circuit_addr(
+            relay_addr,
+            relay_peer_id,
+            target_peer_id,
+        )?;
+
+        tracing::info!(
+            %target_peer_id,
+            %relay_peer_id,
+            "dialing peer via relay circuit"
+        );
+
+        self.swarm
+            .dial(circuit_addr)
+            .map_err(|e| BitevachatError::NetworkError {
+                reason: format!("failed to dial via relay: {e}"),
             })
     }
 
@@ -255,19 +378,6 @@ impl BitevachatSwarm {
     /// The message is wrapped in a [`WireMessage`] with the sender's
     /// public key and tracked by the [`Router`]. The result (ACK or
     /// failure) is delivered asynchronously as a [`NetworkEvent`].
-    ///
-    /// # Parameters
-    ///
-    /// - `peer_id` — target peer's libp2p PeerId.
-    /// - `envelope` — signed message envelope.
-    /// - `sender_pubkey` — sender's Ed25519 public key (32 bytes).
-    /// - `message_id` — message identifier for tracking.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on successful queueing. The actual delivery result
-    /// arrives later as a `NetworkEvent::DeliveryAck` or
-    /// `NetworkEvent::DeliveryFailed`.
     pub fn send_message_to_peer(
         &mut self,
         peer_id: PeerId,
@@ -284,7 +394,8 @@ impl BitevachatSwarm {
             .messaging
             .send_request(&peer_id, wire);
 
-        self.router.track_send(request_id, message_id, recipient, envelope);
+        self.router
+            .track_send(request_id, message_id, recipient, envelope);
 
         Ok(())
     }
@@ -299,7 +410,11 @@ impl BitevachatSwarm {
         topic_name: &str,
         data: Vec<u8>,
     ) -> BResult<()> {
-        gossip::publish_metadata(&mut self.swarm.behaviour_mut().gossip, topic_name, data)
+        gossip::publish_metadata(
+            &mut self.swarm.behaviour_mut().gossip,
+            topic_name,
+            data,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -344,7 +459,10 @@ impl BitevachatSwarm {
                     num_established,
                     ..
                 } => {
-                    tracing::info!(%peer_id, ?cause, num_established, "connection closed");
+                    tracing::info!(
+                        %peer_id, ?cause, num_established,
+                        "connection closed"
+                    );
                     if num_established == 0 {
                         let _ = self
                             .event_sender
@@ -397,6 +515,30 @@ impl BitevachatSwarm {
             }
             BitevachatBehaviourEvent::Gossip(gossip_event) => {
                 self.handle_gossip_event(gossip_event);
+            }
+            BitevachatBehaviourEvent::Autonat(autonat_event) => {
+                if let Some(new_status) =
+                    self.nat_manager.on_autonat_event(autonat_event)
+                {
+                    let _ = self
+                        .event_sender
+                        .send(NetworkEvent::NatStatusChanged(new_status));
+                }
+            }
+            BitevachatBehaviourEvent::RelayClient(relay_event) => {
+                relay_mod::log_relay_client_event(&relay_event);
+            }
+            BitevachatBehaviourEvent::Dcutr(dcutr_event) => {
+                if let Some(peer_id) =
+                    hole_punch::handle_dcutr_event(dcutr_event)
+                {
+                    let _ = self
+                        .event_sender
+                        .send(NetworkEvent::HolePunchSucceeded(peer_id));
+                }
+            }
+            BitevachatBehaviourEvent::RelayServer(relay_event) => {
+                relay_mod::log_relay_server_event(&relay_event);
             }
         }
     }
@@ -453,14 +595,19 @@ impl BitevachatSwarm {
                                 .send(NetworkEvent::DeliveryAck(msg_id));
                         }
                         DeliveryStatus::Failed => {
-                            tracing::warn!(?msg_id, %peer, ?response, "message rejected by peer");
+                            tracing::warn!(
+                                ?msg_id, %peer, ?response,
+                                "message rejected by peer"
+                            );
                             let _ = self
                                 .event_sender
                                 .send(NetworkEvent::DeliveryFailed(msg_id));
                         }
                         DeliveryStatus::Queued => {
-                            // Should not occur for an ACK, but handle gracefully.
-                            tracing::debug!(?msg_id, "unexpected Queued status on ACK");
+                            tracing::debug!(
+                                ?msg_id,
+                                "unexpected Queued status on ACK"
+                            );
                         }
                     }
                 }
@@ -472,7 +619,10 @@ impl BitevachatSwarm {
                 request_id,
                 error,
             } => {
-                tracing::warn!(%peer, ?error, "outbound message delivery failed");
+                tracing::warn!(
+                    %peer, ?error,
+                    "outbound message delivery failed"
+                );
                 if let Some(pending) = self.router.on_send_failed(&request_id) {
                     let _ = self
                         .event_sender
@@ -550,7 +700,10 @@ fn handle_kademlia_event(event: kad::Event) {
                     tracing::info!(?id, %peer_id, "DHT get_record succeeded");
                 }
                 Err(e) => {
-                    tracing::warn!(?id, %e, "DHT get_record returned unparseable value");
+                    tracing::warn!(
+                        ?id, %e,
+                        "DHT get_record returned unparseable value"
+                    );
                 }
             },
             kad::QueryResult::GetRecord(Ok(
@@ -571,7 +724,10 @@ fn handle_kademlia_event(event: kad::Event) {
                 peer,
                 num_remaining,
             })) => {
-                tracing::info!(?id, %peer, num_remaining, "Kademlia bootstrap progress");
+                tracing::info!(
+                    ?id, %peer, num_remaining,
+                    "Kademlia bootstrap progress"
+                );
             }
             kad::QueryResult::Bootstrap(Err(e)) => {
                 tracing::warn!(?id, ?e, "Kademlia bootstrap failed");
@@ -636,12 +792,13 @@ fn build_combined_behaviour(
     key: &libp2p::identity::Keypair,
     config: &NetworkConfig,
     signing_keypair: &libp2p::identity::Keypair,
+    relay_client: relay::client::Behaviour,
 ) -> BResult<BitevachatBehaviour> {
+    let local_peer_id = key.public().to_peer_id();
+
     let discovery = build_discovery_behaviour(key, config)?;
 
     // Use the built-in CBOR codec from libp2p-request-response.
-    // Behaviour::new creates a default cbor::Codec internally;
-    // WireMessage/Ack implement Serialize + Deserialize via serde.
     let messaging = libp2p_request_response::cbor::Behaviour::<WireMessage, Ack>::new(
         [(MSG_PROTOCOL, ProtocolSupport::Full)],
         request_response::Config::default(),
@@ -650,9 +807,28 @@ fn build_combined_behaviour(
     let mut gossip_beh = gossip::build_gossip_behaviour(signing_keypair)?;
     subscribe_default_topics(&mut gossip_beh)?;
 
+    // AutoNAT for NAT status detection.
+    let autonat_config = nat::build_autonat_config(config.autonat_confidence_max);
+    let autonat = autonat::Behaviour::new(local_peer_id, autonat_config);
+
+    // DCUtR for hole punching.
+    let dcutr = dcutr::Behaviour::new(local_peer_id);
+
+    // Optional relay server.
+    let relay_server = Toggle::from(
+        relay_mod::build_relay_server_behaviour(
+            local_peer_id,
+            config.enable_relay_server,
+        ),
+    );
+
     Ok(BitevachatBehaviour {
         discovery,
         messaging,
         gossip: gossip_beh,
+        autonat,
+        relay_client,
+        dcutr,
+        relay_server,
     })
 }

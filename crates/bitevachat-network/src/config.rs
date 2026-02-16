@@ -17,9 +17,14 @@ use bitevachat_types::{BitevachatError, Result};
 /// Network-layer configuration.
 ///
 /// Controls listening addresses, bootstrap peers, connection
-/// limits, and timeout durations for the libp2p swarm.
+/// limits, timeout durations, and NAT traversal settings for the
+/// libp2p swarm.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetworkConfig {
+    // -----------------------------------------------------------------------
+    // Core networking
+    // -----------------------------------------------------------------------
+
     /// Multiaddr on which this node listens for incoming connections.
     ///
     /// Default: `/ip4/0.0.0.0/tcp/0` (OS-assigned port on all interfaces).
@@ -43,6 +48,10 @@ pub struct NetworkConfig {
     /// Seconds before an outbound dial attempt is aborted.
     pub dial_timeout_secs: u64,
 
+    // -----------------------------------------------------------------------
+    // Kademlia DHT
+    // -----------------------------------------------------------------------
+
     /// Custom Kademlia protocol name for network isolation.
     ///
     /// Nodes using different protocol names will not exchange
@@ -55,6 +64,74 @@ pub struct NetworkConfig {
 
     /// Seconds before a Kademlia query times out.
     pub kad_query_timeout_secs: u64,
+
+    // -----------------------------------------------------------------------
+    // NAT traversal
+    // -----------------------------------------------------------------------
+
+    /// Enable AutoNAT for automatic NAT status detection.
+    ///
+    /// When enabled, the node periodically probes connected peers
+    /// to determine whether it is publicly reachable.
+    ///
+    /// Default: `true`.
+    pub enable_autonat: bool,
+
+    /// Number of AutoNAT confirmations before status is considered
+    /// stable.
+    ///
+    /// Higher values reduce false positives but increase detection
+    /// latency. Default: `3`.
+    pub autonat_confidence_max: usize,
+
+    /// Enable relay client mode.
+    ///
+    /// When enabled, the node can connect to peers through relay
+    /// nodes when direct connections fail. Required for DCUtR hole
+    /// punching.
+    ///
+    /// Default: `true`.
+    pub enable_relay_client: bool,
+
+    /// Enable relay server mode.
+    ///
+    /// When enabled, this node can serve as a relay for other peers
+    /// that are behind NATs. Only enable on nodes with public IP
+    /// addresses and sufficient bandwidth.
+    ///
+    /// Default: `false`.
+    pub enable_relay_server: bool,
+
+    /// Relay-only mode.
+    ///
+    /// When enabled, direct dials are disabled and all outbound
+    /// connections go through relay nodes. Useful for nodes on
+    /// highly restricted networks.
+    ///
+    /// Default: `false`.
+    pub relay_only: bool,
+
+    /// Relay server addresses.
+    ///
+    /// Multiaddrs of known relay nodes. Must include `/p2p/<peer_id>`
+    /// component. The node will attempt to reserve slots on these
+    /// relays when behind a NAT.
+    #[serde(with = "multiaddr_vec_serde")]
+    pub relay_servers: Vec<Multiaddr>,
+
+    /// Enable TURN fallback.
+    ///
+    /// TURN is a last-resort fallback for nodes that cannot be
+    /// reached via direct, hole-punch, or relay. Currently a stub.
+    ///
+    /// Default: `false`.
+    pub enable_turn: bool,
+
+    /// TURN server URLs.
+    ///
+    /// Format: `turn:<host>:<port>`. Credentials are provided
+    /// separately at runtime.
+    pub turn_servers: Vec<String>,
 }
 
 impl Default for NetworkConfig {
@@ -74,6 +151,15 @@ impl Default for NetworkConfig {
             kad_protocol: "/bitevachat/kad/1.0.0".into(),
             kad_replication_factor: 20,
             kad_query_timeout_secs: 30,
+            // NAT traversal defaults
+            enable_autonat: true,
+            autonat_confidence_max: 3,
+            enable_relay_client: true,
+            enable_relay_server: false,
+            relay_only: false,
+            relay_servers: Vec::new(),
+            enable_turn: false,
+            turn_servers: Vec::new(),
         }
     }
 }
@@ -119,6 +205,29 @@ impl NetworkConfig {
                 reason: "kad_query_timeout_secs must be greater than 0".into(),
             });
         }
+
+        // NAT traversal validation
+        if self.autonat_confidence_max == 0 {
+            return Err(BitevachatError::ConfigError {
+                reason: "autonat_confidence_max must be greater than 0".into(),
+            });
+        }
+        if self.relay_only && !self.enable_relay_client {
+            return Err(BitevachatError::ConfigError {
+                reason: "relay_only requires enable_relay_client to be true".into(),
+            });
+        }
+        if self.relay_only && self.relay_servers.is_empty() {
+            return Err(BitevachatError::ConfigError {
+                reason: "relay_only requires at least one relay_server".into(),
+            });
+        }
+        if self.enable_turn && self.turn_servers.is_empty() {
+            return Err(BitevachatError::ConfigError {
+                reason: "enable_turn requires at least one turn_server".into(),
+            });
+        }
+
         Ok(())
     }
 }
@@ -250,5 +359,60 @@ mod tests {
             ..NetworkConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    // NAT traversal config tests
+
+    #[test]
+    fn zero_autonat_confidence_rejected() {
+        let config = NetworkConfig {
+            autonat_confidence_max: 0,
+            ..NetworkConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn relay_only_without_client_rejected() {
+        let config = NetworkConfig {
+            relay_only: true,
+            enable_relay_client: false,
+            relay_servers: vec!["/ip4/1.2.3.4/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".parse().unwrap()],
+            ..NetworkConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn relay_only_without_servers_rejected() {
+        let config = NetworkConfig {
+            relay_only: true,
+            enable_relay_client: true,
+            relay_servers: Vec::new(),
+            ..NetworkConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn turn_enabled_without_servers_rejected() {
+        let config = NetworkConfig {
+            enable_turn: true,
+            turn_servers: Vec::new(),
+            ..NetworkConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn valid_nat_config() {
+        let config = NetworkConfig {
+            enable_autonat: true,
+            enable_relay_client: true,
+            enable_relay_server: false,
+            relay_only: false,
+            ..NetworkConfig::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }
