@@ -1,34 +1,48 @@
 //! Periodic scheduler for retrying pending messages.
 //!
-//! Runs a tokio interval loop that:
-//! 1. Purges expired entries.
-//! 2. Dequeues ready entries.
-//! 3. Attempts delivery (placeholder — network layer not implemented).
-//! 4. Marks each entry as delivered or failed.
+//! The [`PendingScheduler`] is driven by the node event loop — it
+//! does NOT run its own loop or spawn tasks. On each tick:
 //!
-//! **This module is a structural skeleton.** The actual network send
-//! logic will be implemented when the network layer is built.
+//! 1. Purge expired entries (TTL exceeded).
+//! 2. Dequeue entries whose backoff period has elapsed.
+//! 3. Return the ready entries to the event loop for delivery.
+//!
+//! The event loop handles actual network delivery and calls
+//! `PendingQueue::mark_delivered` / `mark_failed` based on the
+//! outcome. This design avoids ownership conflicts (the scheduler
+//! never touches the swarm) and keeps all mutable state in the
+//! event loop.
+//!
+//! # Backoff
+//!
+//! Exponential: `min(2^retry_count minutes, cap)`.
+//! Sequence: 1m, 2m, 4m, 8m, 16m, 32m, 60m (cap), 60m, …
+//!
+//! See [`bitevachat_storage::pending::compute_backoff_secs`] for the
+//! implementation.
 
 use std::sync::Arc;
 
-use bitevachat_storage::pending::PendingQueue;
-use bitevachat_types::{Result, Timestamp};
+use bitevachat_storage::pending::{PendingEntry, PendingQueue};
+use bitevachat_types::{BitevachatError, Timestamp};
+
+/// Convenience alias.
+type BResult<T> = std::result::Result<T, BitevachatError>;
 
 // ---------------------------------------------------------------------------
 // PendingScheduler
 // ---------------------------------------------------------------------------
 
-/// Periodic background scheduler for pending message delivery.
+/// Scheduler for pending message delivery retries.
 ///
-/// Holds a shared reference to the [`PendingQueue`] and configuration
-/// for TTL and tick interval.
+/// Holds a shared reference to the [`PendingQueue`] and the TTL
+/// configuration. Created once by the event loop and called on
+/// each pending tick interval.
 pub struct PendingScheduler {
     /// Shared pending queue (thread-safe via internal `Mutex`).
     queue: Arc<PendingQueue>,
     /// TTL for pending entries in days.
     ttl_days: u64,
-    /// Interval between scheduler ticks in seconds.
-    tick_interval_secs: u64,
 }
 
 impl PendingScheduler {
@@ -37,91 +51,74 @@ impl PendingScheduler {
     /// # Parameters
     ///
     /// - `queue` — shared pending queue.
-    /// - `ttl_days` — message TTL in days.
-    /// - `tick_interval_secs` — seconds between scheduler ticks.
-    pub fn new(
-        queue: Arc<PendingQueue>,
-        ttl_days: u64,
-        tick_interval_secs: u64,
-    ) -> Self {
-        Self {
-            queue,
-            ttl_days,
-            tick_interval_secs,
-        }
-    }
-
-    /// Runs the scheduler loop.
-    ///
-    /// This method runs indefinitely, processing pending messages at
-    /// each tick. It should be spawned as a tokio task:
-    ///
-    /// ```ignore
-    /// tokio::spawn(scheduler.run());
-    /// ```
-    pub async fn run(self) {
-        let mut interval = tokio::time::interval(
-            tokio::time::Duration::from_secs(self.tick_interval_secs),
-        );
-
-        loop {
-            interval.tick().await;
-
-            if let Err(e) = self.tick().await {
-                // Log error but do not crash the scheduler.
-                // TODO: integrate with structured logging when available.
-                eprintln!("pending scheduler tick error: {e}");
-            }
-        }
+    /// - `ttl_days` — message TTL in days. Entries older than this
+    ///   are purged on each tick.
+    pub fn new(queue: Arc<PendingQueue>, ttl_days: u64) -> Self {
+        Self { queue, ttl_days }
     }
 
     /// Executes a single scheduler tick.
     ///
-    /// 1. Purge expired entries.
-    /// 2. Dequeue ready entries.
-    /// 3. Attempt delivery for each (placeholder).
-    /// 4. Mark as delivered or failed.
-    async fn tick(&self) -> Result<()> {
+    /// # Steps
+    ///
+    /// 1. Purge expired entries (age > TTL).
+    /// 2. Dequeue entries whose backoff has elapsed.
+    /// 3. Return the ready entries.
+    ///
+    /// The caller is responsible for attempting delivery and calling
+    /// `mark_delivered` / `mark_failed` on the pending queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BitevachatError::StorageError` if the pending queue
+    /// lock is poisoned or file persistence fails.
+    pub fn tick(&self) -> BResult<Vec<PendingEntry>> {
         let now = Timestamp::now();
 
         // 1. Purge expired entries.
-        let _purged = self.queue.purge_expired(self.ttl_days, &now)?;
+        let purged = self.queue.purge_expired(self.ttl_days, &now)?;
+        if purged > 0 {
+            tracing::info!(
+                purged,
+                ttl_days = self.ttl_days,
+                "pending scheduler: purged expired entries"
+            );
+        }
 
         // 2. Dequeue ready entries.
         let ready = self.queue.dequeue_ready(&now)?;
 
-        // 3+4. Attempt delivery for each ready entry.
-        for entry in &ready {
-            let msg_id = entry.message_id().clone();
-
-            // TODO: Replace with actual network send when network layer
-            // is implemented. The send function should take the
-            // entry.envelope and attempt delivery to entry.recipient.
-            let delivery_result = Self::try_send(&entry).await;
-
-            match delivery_result {
-                Ok(()) => {
-                    let _ = self.queue.mark_delivered(&msg_id);
-                }
-                Err(_) => {
-                    let fail_now = Timestamp::now();
-                    let _ = self.queue.mark_failed(&msg_id, &fail_now);
-                }
-            }
+        if !ready.is_empty() {
+            tracing::debug!(
+                ready = ready.len(),
+                "pending scheduler: entries ready for retry"
+            );
         }
 
-        Ok(())
+        Ok(ready)
     }
 
-    /// Placeholder for network send logic.
-    ///
-    /// TODO: Implement actual message delivery via the network layer.
-    /// This function should serialize the envelope, resolve the
-    /// recipient's node address, and transmit the message.
-    async fn try_send(
-        _entry: &bitevachat_storage::pending::PendingEntry,
-    ) -> std::result::Result<(), ()> {
-        // Stub: always fails until network layer is implemented.
-        Err(())
+    /// Returns the current total number of pending entries.
+    pub fn pending_count(&self) -> BResult<usize> {
+        self.queue.total_count()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduler_struct_is_constructible() {
+        // PendingScheduler requires a real PendingQueue backed by a
+        // temp file. Full behavior tests live in integration tests.
+        // This test verifies the public API surface compiles.
+        fn _assert_send<T: Send>() {}
+        // PendingScheduler is Send because Arc<PendingQueue> is Send.
+        _assert_send::<PendingScheduler>();
     }
 }

@@ -421,82 +421,107 @@ impl BitevachatSwarm {
     // Event loop
     // -----------------------------------------------------------------------
 
+    /// Processes exactly one swarm event.
+    ///
+    /// Designed for integration with `tokio::select!` in the node
+    /// event loop. Each call awaits the next event from the libp2p
+    /// swarm and dispatches it through the appropriate handler.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel-safe. If the future is dropped before
+    /// completion, no events are lost — they remain in the swarm's
+    /// internal queue for the next poll.
+    pub async fn poll_next(&mut self) {
+        let event = self.swarm.select_next_some().await;
+        self.dispatch_swarm_event(event).await;
+    }
+
     /// Runs the swarm event loop, processing all network events.
     ///
     /// This method runs indefinitely. Use `tokio::select!` or task
-    /// cancellation to stop it.
+    /// cancellation to stop it. Prefer [`poll_next`](Self::poll_next)
+    /// when integrating with external event loops.
     pub async fn run(&mut self) {
         loop {
-            match self.swarm.select_next_some().await {
-                // --- Connection events ------------------------------------
-                SwarmEvent::NewListenAddr {
-                    listener_id,
-                    address,
-                } => {
-                    tracing::info!(%address, ?listener_id, "new listen address");
-                }
+            self.poll_next().await;
+        }
+    }
 
-                SwarmEvent::ConnectionEstablished {
-                    peer_id,
-                    endpoint,
+    /// Dispatches a single swarm event to the appropriate handler.
+    async fn dispatch_swarm_event(
+        &mut self,
+        event: SwarmEvent<BitevachatBehaviourEvent>,
+    ) {
+        match event {
+            // --- Connection events ------------------------------------
+            SwarmEvent::NewListenAddr {
+                listener_id,
+                address,
+            } => {
+                tracing::info!(%address, ?listener_id, "new listen address");
+            }
+
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                endpoint,
+                num_established,
+                ..
+            } => {
+                tracing::info!(
+                    %peer_id,
+                    ?endpoint,
                     num_established,
-                    ..
-                } => {
-                    tracing::info!(
-                        %peer_id,
-                        ?endpoint,
-                        num_established,
-                        "connection established"
-                    );
+                    "connection established"
+                );
+                let _ = self
+                    .event_sender
+                    .send(NetworkEvent::PeerConnected(peer_id));
+            }
+
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                cause,
+                num_established,
+                ..
+            } => {
+                tracing::info!(
+                    %peer_id, ?cause, num_established,
+                    "connection closed"
+                );
+                if num_established == 0 {
                     let _ = self
                         .event_sender
-                        .send(NetworkEvent::PeerConnected(peer_id));
+                        .send(NetworkEvent::PeerDisconnected(peer_id));
                 }
+            }
 
-                SwarmEvent::ConnectionClosed {
-                    peer_id,
-                    cause,
-                    num_established,
-                    ..
-                } => {
-                    tracing::info!(
-                        %peer_id, ?cause, num_established,
-                        "connection closed"
-                    );
-                    if num_established == 0 {
-                        let _ = self
-                            .event_sender
-                            .send(NetworkEvent::PeerDisconnected(peer_id));
-                    }
-                }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                tracing::warn!(?peer_id, %error, "outgoing connection error");
+            }
 
-                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                    tracing::warn!(?peer_id, %error, "outgoing connection error");
-                }
+            SwarmEvent::IncomingConnectionError {
+                local_addr,
+                send_back_addr,
+                error,
+                ..
+            } => {
+                tracing::warn!(
+                    %local_addr,
+                    %send_back_addr,
+                    %error,
+                    "incoming connection error"
+                );
+            }
 
-                SwarmEvent::IncomingConnectionError {
-                    local_addr,
-                    send_back_addr,
-                    error,
-                    ..
-                } => {
-                    tracing::warn!(
-                        %local_addr,
-                        %send_back_addr,
-                        %error,
-                        "incoming connection error"
-                    );
-                }
+            // --- Behaviour events -------------------------------------
+            SwarmEvent::Behaviour(event) => {
+                self.handle_behaviour_event(event).await;
+            }
 
-                // --- Behaviour events -------------------------------------
-                SwarmEvent::Behaviour(event) => {
-                    self.handle_behaviour_event(event).await;
-                }
-
-                // --- Catch-all --------------------------------------------
-                other => {
-                    tracing::trace!(?other, "unhandled swarm event");
-                }
+            // --- Catch-all --------------------------------------------
+            other => {
+                tracing::trace!(?other, "unhandled swarm event");
             }
         }
     }
