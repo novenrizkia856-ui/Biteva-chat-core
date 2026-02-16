@@ -23,3 +23,5 @@ pub mod session;
 pub mod signing;
 pub mod validation;
 pub mod pow;
+pub mod cid;
+pub mod profiles;

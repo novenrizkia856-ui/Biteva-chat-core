@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BitevachatError, Result};
+use bitevachat_types::{BitevachatError, Result};
 
 /// Global application configuration.
 ///

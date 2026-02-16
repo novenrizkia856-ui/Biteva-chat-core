@@ -15,6 +15,7 @@ use crate::contacts::ContactStore;
 use crate::conversations::ConversationIndex;
 use crate::encrypted_tree::EncryptedTree;
 use crate::messages::MessageStore;
+use crate::profile::{AvatarStore, ProfileStore};
 use crate::settings::SettingsStore;
 
 // ---------------------------------------------------------------------------
@@ -122,7 +123,7 @@ impl StorageEngine {
         })?;
 
         // Pre-create all trees so they exist for later access.
-        for name in &["messages", "conversations", "contacts", "settings", "pins"] {
+        for name in &["messages", "conversations", "contacts", "settings", "pins", "profiles", "avatars"] {
             db.open_tree(name).map_err(|e| BitevachatError::StorageError {
                 reason: format!("failed to open tree '{name}': {e}"),
             })?;
@@ -146,6 +147,14 @@ impl StorageEngine {
     /// Returns a reference to the derived keys (crate-internal).
     pub(crate) fn keys(&self) -> &DerivedKeys {
         &self.keys
+    }
+
+    pub fn profiles(&self) -> Result<ProfileStore<'_>> {
+        ProfileStore::new(self)
+    }
+
+    pub fn avatars(&self) -> Result<AvatarStore<'_>> {
+        AvatarStore::new(self)
     }
 
     /// Opens a named sled tree.

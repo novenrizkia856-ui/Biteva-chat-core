@@ -16,6 +16,7 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 zeroize = { version = "1", features = ["derive"] }
 chrono = "0.4"
+ciborium = "0.2"
 
 [features]
 rocksdb = []

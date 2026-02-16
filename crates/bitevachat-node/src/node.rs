@@ -114,6 +114,7 @@ pub(crate) struct NodeRuntime {
     pub pending_tick_secs: u64,
     pub maintenance_tick_secs: u64,
     pub spam_filter: crate::spam_filter::SpamFilter,
+    pub profile_manager: crate::profile_manager::ProfileManager,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +221,7 @@ impl Node {
         // Initialize anti-spam filter from config.
         let spam_config = crate::spam_filter::SpamConfig::from(&app_config);
         let spam_filter = crate::spam_filter::SpamFilter::new(spam_config);
+        let profile_manager = crate::profile_manager::ProfileManager::new();
 
         let runtime = NodeRuntime {
             wallet,
@@ -236,6 +238,7 @@ impl Node {
             pending_tick_secs: PENDING_TICK_SECS,
             maintenance_tick_secs: MAINTENANCE_TICK_SECS,
             spam_filter,
+            profile_manager,
         };
 
         Ok(Self {

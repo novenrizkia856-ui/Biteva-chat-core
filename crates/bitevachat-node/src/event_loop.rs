@@ -16,6 +16,7 @@
 use std::time::Duration;
 
 use bitevachat_network::events::NetworkEvent;
+use bitevachat_network::gossip::TOPIC_PROFILE_UPDATES;
 use bitevachat_types::{BitevachatError, MessageId, NodeEvent, NodeId, Timestamp};
 
 use crate::command::{ContactInfo, MessageInfo, NodeCommand, NodeStatus, PeerInfo};
@@ -26,7 +27,7 @@ use crate::outgoing;
 use crate::pending_scheduler::PendingScheduler;
 
 // ---------------------------------------------------------------------------
-// Helper: PeerId → NodeId
+// Helper: PeerId -> NodeId
 // ---------------------------------------------------------------------------
 
 /// Converts a libp2p `PeerId` to a Bitevachat `NodeId`.
@@ -48,14 +49,13 @@ fn peer_id_to_node_id(peer_id: &libp2p::PeerId) -> NodeId {
 ///
 /// This function takes ownership of the [`NodeRuntime`] and runs
 /// until the shutdown watch channel fires. It is designed to be
-/// spawned as a single tokio task — all mutable state lives here,
-/// eliminating the need for locks on hot paths.
+/// spawned as a tokio task via `Node::start`.
 pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
-    tracing::info!("node event loop starting");
+    tracing::info!("node event loop started");
 
     let scheduler = PendingScheduler::new(
         rt.pending_queue.clone(),
-        rt.config.pending_ttl_days,
+        rt.pending_tick_secs,
     );
 
     let mut pending_tick = tokio::time::interval(
@@ -67,7 +67,7 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
 
     // Start listening on the configured address.
     if let Err(e) = rt.network.start_listening(rt.listen_addr.clone()) {
-        tracing::error!(%e, "failed to start listening — continuing without listener");
+        tracing::error!(%e, "failed to start listening -- continuing without listener");
     }
 
     loop {
@@ -87,6 +87,7 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
                 handle_network_event(
                     net_event,
                     &rt.spam_filter,
+                    &rt.profile_manager,
                     &rt.storage,
                     &rt.pending_queue,
                     &rt.event_tx,
@@ -99,7 +100,7 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
             Some(cmd) = rt.command_rx.recv() => {
                 let should_shutdown = handle_command(cmd, &mut rt);
                 if should_shutdown {
-                    tracing::info!("shutdown command received — exiting event loop");
+                    tracing::info!("shutdown command received -- exiting event loop");
                     break;
                 }
             }
@@ -123,7 +124,7 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
             // ---------------------------------------------------------------
             _ = rt.shutdown_rx.changed() => {
                 if *rt.shutdown_rx.borrow() {
-                    tracing::info!("shutdown signal received — exiting event loop");
+                    tracing::info!("shutdown signal received -- exiting event loop");
                     break;
                 }
             }
@@ -144,6 +145,7 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
 async fn handle_network_event(
     event: NetworkEvent,
     spam_filter: &crate::spam_filter::SpamFilter,
+    profile_manager: &crate::profile_manager::ProfileManager,
     storage: &bitevachat_storage::engine::StorageEngine,
     pending_queue: &std::sync::Arc<bitevachat_storage::pending::PendingQueue>,
     event_tx: &tokio::sync::mpsc::Sender<NodeEvent>,
@@ -199,12 +201,14 @@ async fn handle_network_event(
         }
 
         NetworkEvent::GossipMessage { source, topic, data } => {
-            tracing::debug!(
-                %source,
-                %topic,
-                bytes = data.len(),
-                "gossip message received"
-            );
+            handle_gossip_message(
+                &source,
+                &topic,
+                &data,
+                profile_manager,
+                storage,
+                event_tx,
+            ).await;
         }
 
         NetworkEvent::NatStatusChanged(status) => {
@@ -212,9 +216,65 @@ async fn handle_network_event(
         }
 
         NetworkEvent::HolePunchSucceeded(peer_id) => {
-            tracing::info!(%peer_id, "hole punch succeeded — direct connection active");
+            tracing::info!(%peer_id, "hole punch succeeded -- direct connection active");
         }
     }
+}
+
+/// Handles a gossip message by dispatching based on topic.
+async fn handle_gossip_message(
+    source: &libp2p::PeerId,
+    topic: &str,
+    data: &[u8],
+    profile_manager: &crate::profile_manager::ProfileManager,
+    storage: &bitevachat_storage::engine::StorageEngine,
+    event_tx: &tokio::sync::mpsc::Sender<NodeEvent>,
+) {
+    tracing::debug!(
+        %source,
+        topic,
+        bytes = data.len(),
+        "gossip message received"
+    );
+
+    if topic == TOPIC_PROFILE_UPDATES {
+        handle_gossip_profile_update(data, profile_manager, storage, event_tx).await;
+    }
+    // Other topics (e.g. "presence") can be added here.
+}
+
+/// Processes a profile update received via gossip.
+///
+/// All errors are logged and swallowed — a malformed gossip message
+/// must never crash the event loop.
+async fn handle_gossip_profile_update(
+    data: &[u8],
+    profile_manager: &crate::profile_manager::ProfileManager,
+    storage: &bitevachat_storage::engine::StorageEngine,
+    event_tx: &tokio::sync::mpsc::Sender<NodeEvent>,
+) {
+    let signed = match bitevachat_protocol::profiles::deserialize_signed_profile(data) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(%e, "failed to deserialize gossip profile");
+            return;
+        }
+    };
+
+    tracing::debug!(
+        address = %signed.profile.address,
+        version = signed.profile.version,
+        "received profile update via gossip (pubkey lookup pending)"
+    );
+
+    // Emit event to notify consumers that a profile arrived.
+    // Full verification will be added when PeerId->PublicKey
+    // mapping is wired from the identify protocol.
+    let _ = event_tx
+        .send(NodeEvent::ProfileUpdated {
+            address: signed.profile.address,
+        })
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,14 +367,52 @@ fn handle_command(
             false
         }
 
+        NodeCommand::UpdateProfile { name, bio, avatar_bytes, reply } => {
+            let mapped = match rt.wallet.get_keypair() {
+                Ok(keypair) => {
+                    let result = rt.profile_manager.update_profile(
+                        keypair,
+                        name,
+                        bio,
+                        avatar_bytes.as_deref(),
+                        &rt.storage,
+                    );
+                    result.map(|_cbor_bytes| {
+                        let address = bitevachat_crypto::signing::pubkey_to_address(
+                            &keypair.public_key(),
+                        );
+                        let (cid_str, version) = rt.profile_manager
+                            .get_profile(&address)
+                            .map(|signed| {
+                                let cid = signed.profile.avatar_cid
+                                    .map(|c| c.to_string())
+                                    .unwrap_or_default();
+                                (cid, signed.profile.version)
+                            })
+                            .unwrap_or_else(|| (String::new(), 1));
+                        (cid_str, version)
+                    })
+                }
+                Err(e) => Err(e),
+            };
+            let _ = reply.send(mapped);
+            false
+        }
+
+        NodeCommand::GetProfile { address, reply } => {
+            let result = rt.profile_manager.get_profile_with_fallback(
+                &address,
+                &rt.storage,
+            );
+            let _ = reply.send(result);
+            false
+        }
+
         NodeCommand::Shutdown => true,
     }
 }
 
-/// Handles the SendMessage command: build envelope → enqueue pending.
-///
-/// Synchronous — no network I/O here. Actual delivery is handled
-/// by the pending scheduler on the next tick.
+/// Handles the SendMessage command: build envelope -> enqueue pending.
 fn handle_send_message(
     rt: &mut NodeRuntime,
     recipient: bitevachat_types::Address,
@@ -331,17 +429,6 @@ fn handle_send_message(
         rt.node_id,
     )?;
 
-    // Resolve recipient PeerId via DHT lookup.
-    // The DHT query is asynchronous — results arrive via Kademlia
-    // events. For the initial implementation, we enqueue the message
-    // as pending and let the scheduler handle delivery when the
-    // peer is discovered.
-    //
-    // TODO: Implement synchronous peer cache lookup. If the peer
-    // is already known/connected, send immediately via
-    // `network.send_message_to_peer()`.
-
-    // Enqueue for pending delivery.
     let pending_entry = bitevachat_storage::pending::PendingEntry {
         envelope: envelope.clone(),
         retry_count: 0,
@@ -392,75 +479,54 @@ fn build_status(rt: &NodeRuntime) -> NodeStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Message query handlers (stubs — pending MessageStore CRUD API)
+// Message query handlers (stubs)
 // ---------------------------------------------------------------------------
 
-/// Lists messages in a conversation.
-///
-/// Stub: returns empty vec until `MessageStore.list()` is implemented.
 fn handle_list_messages(
     _storage: &bitevachat_storage::engine::StorageEngine,
     _convo_id: bitevachat_types::ConvoId,
     _limit: u64,
     _offset: u64,
 ) -> std::result::Result<Vec<MessageInfo>, BitevachatError> {
-    // TODO: Delegate to storage.messages()?.list(convo_id, limit, offset)
-    // when MessageStore CRUD API is finalized.
-    tracing::debug!("ListMessages: stub — returning empty");
+    tracing::debug!("ListMessages: stub -- returning empty");
     Ok(Vec::new())
 }
 
-/// Retrieves a single message by ID.
-///
-/// Stub: returns None until `MessageStore.get()` is implemented.
 fn handle_get_message(
     _storage: &bitevachat_storage::engine::StorageEngine,
     _message_id: MessageId,
 ) -> std::result::Result<Option<MessageInfo>, BitevachatError> {
-    // TODO: Delegate to storage.messages()?.get(message_id)
-    tracing::debug!("GetMessage: stub — returning None");
+    tracing::debug!("GetMessage: stub -- returning None");
     Ok(None)
 }
 
 // ---------------------------------------------------------------------------
-// Contact handlers (stubs — pending ContactStore CRUD API)
+// Contact handlers (stubs)
 // ---------------------------------------------------------------------------
 
-/// Adds or updates a contact alias.
-///
-/// Stub: logs and returns Ok until `ContactStore.set_alias()` is implemented.
 fn handle_add_contact(
     _storage: &bitevachat_storage::engine::StorageEngine,
     address: bitevachat_types::Address,
     alias: &str,
 ) -> std::result::Result<(), BitevachatError> {
-    // TODO: Delegate to storage.contacts()?.set_alias(address, alias)
-    tracing::debug!(%address, alias, "AddContact: stub — not persisted");
+    tracing::debug!(%address, alias, "AddContact: stub -- not persisted");
     Ok(())
 }
 
-/// Blocks or unblocks a contact.
-///
-/// Stub: logs and returns Ok until `ContactStore.set_blocked()` is implemented.
 fn handle_block_contact(
     _storage: &bitevachat_storage::engine::StorageEngine,
     address: bitevachat_types::Address,
     blocked: bool,
 ) -> std::result::Result<(), BitevachatError> {
-    // TODO: Delegate to storage.contacts()?.set_blocked(address, blocked)
     let action = if blocked { "block" } else { "unblock" };
-    tracing::debug!(%address, action, "BlockContact: stub — not persisted");
+    tracing::debug!(%address, action, "BlockContact: stub -- not persisted");
     Ok(())
 }
 
-/// Lists all contacts.
-///
-/// Stub: returns empty vec until `ContactStore.list()` is implemented.
 fn handle_list_contacts(
     _storage: &bitevachat_storage::engine::StorageEngine,
 ) -> std::result::Result<Vec<ContactInfo>, BitevachatError> {
-    // TODO: Delegate to storage.contacts()?.list()
-    tracing::debug!("ListContacts: stub — returning empty");
+    tracing::debug!("ListContacts: stub -- returning empty");
     Ok(Vec::new())
 }
 
@@ -468,15 +534,10 @@ fn handle_list_contacts(
 // Peer query handler
 // ---------------------------------------------------------------------------
 
-/// Lists currently connected peers.
-///
-/// Stub: returns empty vec until BitevachatSwarm exposes
-/// `connected_peers()`.
 fn handle_list_peers(
     _rt: &NodeRuntime,
 ) -> std::result::Result<Vec<PeerInfo>, BitevachatError> {
-    // TODO: Iterate rt.network.connected_peers() when API is available.
-    tracing::debug!("ListPeers: stub — returning empty");
+    tracing::debug!("ListPeers: stub -- returning empty");
     Ok(Vec::new())
 }
 
@@ -484,15 +545,6 @@ fn handle_list_peers(
 // Inject message handler
 // ---------------------------------------------------------------------------
 
-/// Processes an externally injected, pre-verified message envelope.
-///
-/// The RPC layer has already verified:
-/// - Ed25519 signature over canonical CBOR
-/// - Pubkey → address binding
-/// - Timestamp skew
-///
-/// The event loop stores it and emits a NodeEvent, same as an
-/// incoming network message.
 fn handle_inject_message(
     storage: &bitevachat_storage::engine::StorageEngine,
     envelope: &bitevachat_protocol::message::MessageEnvelope,
@@ -501,10 +553,8 @@ fn handle_inject_message(
     let sender = &envelope.message.sender;
     let recipient = &envelope.message.recipient;
 
-    // Compute conversation ID (same as incoming.rs).
     let convo_id = incoming::compute_convo_id(sender, recipient);
 
-    // Store envelope (stub — pending MessageStore.put integration).
     let _msg_store = storage.messages()?;
     drop(_msg_store);
 
@@ -521,13 +571,6 @@ fn handle_inject_message(
 // Pending tick handler
 // ---------------------------------------------------------------------------
 
-/// Processes one pending scheduler tick.
-///
-/// Dequeues ready entries and attempts re-delivery. Failures are
-/// handled by the pending queue's backoff mechanism.
-///
-/// Synchronous — `PendingQueue` methods are all blocking. No await
-/// points means no `&NodeRuntime` held across thread boundaries.
 fn handle_pending_tick(
     scheduler: &PendingScheduler,
     pending_queue: &std::sync::Arc<bitevachat_storage::pending::PendingQueue>,
@@ -548,14 +591,6 @@ fn handle_pending_tick(
 
     for entry in &ready {
         let msg_id = entry.message_id().clone();
-
-        // For retry, we need the recipient's PeerId. If we don't have
-        // it cached, start a DHT lookup and skip this entry (the next
-        // tick will retry after the lookup completes).
-        //
-        // TODO: Implement peer cache lookup. When the peer is known
-        // and connected, send directly via the network swarm.
-        // For now, mark as failed so backoff increments.
         let now = Timestamp::now();
         let _ = pending_queue.mark_failed(&msg_id, &now);
     }
@@ -565,11 +600,6 @@ fn handle_pending_tick(
 // Maintenance tick handler
 // ---------------------------------------------------------------------------
 
-/// Runs periodic maintenance tasks.
-///
-/// Synchronous — `run_storage_maintenance` is blocking I/O.
-/// Taking specific fields (`&StorageEngine`, `&AppConfig`) instead
-/// of `&NodeRuntime` avoids the `Sync` bound problem.
 fn handle_maintenance_tick(
     storage: &bitevachat_storage::engine::StorageEngine,
     config: &bitevachat_types::config::AppConfig,
@@ -595,9 +625,6 @@ fn handle_maintenance_tick(
 // ---------------------------------------------------------------------------
 
 /// Performs graceful shutdown: flush storage, log final state.
-///
-/// Synchronous — storage flush is blocking. Takes specific fields
-/// to avoid `&NodeRuntime` shared reference across await points.
 fn shutdown_sequence(
     storage: &bitevachat_storage::engine::StorageEngine,
     pending_queue: &std::sync::Arc<bitevachat_storage::pending::PendingQueue>,

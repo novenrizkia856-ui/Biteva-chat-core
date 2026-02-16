@@ -9,6 +9,7 @@
 //! eliminating race conditions between concurrent RPC calls.
 
 use bitevachat_protocol::message::MessageEnvelope;
+use bitevachat_protocol::profiles::SignedProfile;
 use bitevachat_types::{
     Address, ConvoId, MessageId, NodeId, PayloadType, Timestamp,
 };
@@ -190,6 +191,17 @@ pub enum NodeCommand {
         reply: oneshot::Sender<BResult<MessageId>>,
     },
 
+    UpdateProfile {
+        name: String,
+        bio: String,
+        avatar_bytes: Option<Vec<u8>>,
+        reply: oneshot::Sender<BResult<(String, u64)>>,
+    },
+    GetProfile {
+        address: Address,
+        reply: oneshot::Sender<BResult<Option<SignedProfile>>>,
+    },
+
     /// Initiate graceful shutdown.
     Shutdown,
 }
@@ -236,6 +248,16 @@ impl std::fmt::Debug for NodeCommand {
             Self::GetStatus { .. } => f.write_str("GetStatus"),
             Self::ListPeers { .. } => f.write_str("ListPeers"),
             Self::InjectMessage { .. } => f.write_str("InjectMessage"),
+            Self::UpdateProfile { name, .. } => {
+                f.debug_struct("UpdateProfile")
+                    .field("name", name)
+                    .finish_non_exhaustive()
+            }
+            Self::GetProfile { address, .. } => {
+                f.debug_struct("GetProfile")
+                    .field("address", address)
+                    .finish_non_exhaustive()
+            }
             Self::Shutdown => f.write_str("Shutdown"),
         }
     }

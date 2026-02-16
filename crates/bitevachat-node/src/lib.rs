@@ -53,6 +53,7 @@ pub mod pending_scheduler;
 pub mod trust;
 pub mod rate_limiter;
 pub mod spam_filter;
+pub mod profile_manager;
 
 // Re-exports for RPC and CLI consumers.
 pub use command::{ContactInfo, MessageInfo, NodeCommand, NodeStatus, PeerInfo};

@@ -15,3 +15,4 @@ pub mod pending;
 pub mod pending_file;
 pub mod blocklist;
 pub mod trust;
+pub mod profile;

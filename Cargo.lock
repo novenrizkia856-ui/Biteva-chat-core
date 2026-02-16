@@ -375,6 +375,8 @@ dependencies = [
  "bitevachat-wallet",
  "libp2p",
  "rand 0.8.5",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -418,6 +420,7 @@ dependencies = [
  "bitevachat-protocol",
  "bitevachat-types",
  "chrono",
+ "ciborium",
  "serde",
  "sled",
  "zeroize",

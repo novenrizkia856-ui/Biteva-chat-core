@@ -16,5 +16,7 @@ bitevachat-network = { path = "../bitevachat-network" }
 
 libp2p = { version = "0.54", features = ["identify"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
-tracing = "0.1"
+tracing = "0.1.9"
+serde_json = "1.0.82"
+serde = "1.0.161"
 rand = "0.8"
