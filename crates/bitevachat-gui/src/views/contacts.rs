@@ -1,4 +1,7 @@
 //! Contact management view.
+//!
+//! Each contact has a "Chat" button that signals app.rs to switch
+//! to the Chat tab and open that conversation.
 
 use eframe::egui;
 
@@ -15,6 +18,10 @@ pub struct ContactState {
     pub add_alias: String,
     pub error_msg: String,
     pub show_add_dialog: bool,
+    /// Set by "Chat" button — app.rs reads this to switch to Chat view.
+    pub open_chat_addr: Option<String>,
+    /// Alias for the chat to open (for display in sidebar).
+    pub open_chat_alias: Option<String>,
 }
 
 impl ContactState {
@@ -25,6 +32,8 @@ impl ContactState {
             add_alias: String::new(),
             error_msg: String::new(),
             show_add_dialog: false,
+            open_chat_addr: None,
+            open_chat_alias: None,
         }
     }
 }
@@ -64,16 +73,20 @@ pub fn render(
     }
 
     // Contact list.
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    egui::ScrollArea::vertical().show(ui, |ui: &mut egui::Ui| {
         if state.contacts.is_empty() {
             ui.label(theme::muted("No contacts. Add one to get started."));
             return;
         }
 
-        for i in 0..state.contacts.len() {
-            let contact = &state.contacts[i];
-            let addr = contact.address.clone();
-            let alias = contact.alias.clone();
+        // Collect actions to apply after iteration.
+        let mut block_addr: Option<String> = None;
+        let mut unblock_addr: Option<String> = None;
+        let mut chat_addr: Option<(String, String)> = None;
+
+        for contact in &state.contacts {
+            let addr = &contact.address;
+            let alias = &contact.alias;
             let blocked = contact.blocked;
 
             let frame = egui::Frame::none()
@@ -101,10 +114,10 @@ pub fn render(
 
                     ui.vertical(|ui| {
                         if alias.is_empty() {
-                            ui.label(theme::body(&theme::truncate_hex(&addr, 16)));
+                            ui.label(theme::body(&theme::truncate_hex(addr, 16)));
                         } else {
-                            ui.label(theme::body(&alias));
-                            ui.label(theme::muted(&theme::truncate_hex(&addr, 16)));
+                            ui.label(theme::body(alias));
+                            ui.label(theme::muted(&theme::truncate_hex(addr, 16)));
                         }
                     });
 
@@ -113,18 +126,19 @@ pub fn render(
                         |ui| {
                             if blocked {
                                 if ui.button("Unblock").clicked() {
-                                    let _ = cmd_tx.try_send(UiCommand::UnblockContact {
-                                        address: addr.clone(),
-                                    });
-                                    let _ = cmd_tx.try_send(UiCommand::ListContacts);
+                                    unblock_addr = Some(addr.clone());
                                 }
                                 ui.colored_label(theme::DANGER, "Blocked");
                             } else {
+                                // "Chat" button — opens chat with this contact.
+                                if theme::accent_button(ui, "Chat").clicked() {
+                                    chat_addr = Some((
+                                        addr.clone(),
+                                        alias.clone(),
+                                    ));
+                                }
                                 if theme::danger_button(ui, "Block").clicked() {
-                                    let _ = cmd_tx.try_send(UiCommand::BlockContact {
-                                        address: addr.clone(),
-                                    });
-                                    let _ = cmd_tx.try_send(UiCommand::ListContacts);
+                                    block_addr = Some(addr.clone());
                                 }
                             }
                         },
@@ -132,6 +146,21 @@ pub fn render(
                 });
             });
             ui.separator();
+        }
+
+        // Apply actions.
+        if let Some(addr) = block_addr {
+            let _ = cmd_tx.try_send(UiCommand::BlockContact { address: addr });
+            let _ = cmd_tx.try_send(UiCommand::ListContacts);
+        }
+        if let Some(addr) = unblock_addr {
+            let _ = cmd_tx.try_send(UiCommand::UnblockContact { address: addr });
+            let _ = cmd_tx.try_send(UiCommand::ListContacts);
+        }
+        if let Some((addr, alias)) = chat_addr {
+            // Signal app.rs to switch to Chat view with this contact.
+            state.open_chat_addr = Some(addr);
+            state.open_chat_alias = Some(alias);
         }
     });
 }
@@ -174,10 +203,24 @@ fn render_add_dialog(
             let valid = validate_address(&state.add_address);
             ui.add_enabled_ui(valid, |ui| {
                 if theme::accent_button(ui, "Add").clicked() {
+                    let addr = state.add_address.trim().to_string();
+                    let alias = sanitize_alias(&state.add_alias);
+
+                    // Send AddContact to bridge.
                     let _ = cmd_tx.try_send(UiCommand::AddContact {
-                        address: state.add_address.trim().to_string(),
-                        alias: sanitize_alias(&state.add_alias),
+                        address: addr.clone(),
+                        alias: alias.clone(),
                     });
+
+                    // Add locally for instant feedback.
+                    if !state.contacts.iter().any(|c| c.address == addr) {
+                        state.contacts.push(ContactItem {
+                            address: addr,
+                            alias,
+                            blocked: false,
+                        });
+                    }
+
                     state.show_add_dialog = false;
                     state.error_msg.clear();
                 }

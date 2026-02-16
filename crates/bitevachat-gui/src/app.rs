@@ -1,8 +1,5 @@
 //! Application state and main update loop.
 //!
-//! All heavy work is done in the RPC bridge. The `update()` method
-//! only polls for events, mutates state, and renders the current view.
-//!
 //! Startup flow:
 //! 1. Onboarding (detect wallet / create / import / unlock)
 //! 2. Send `BootstrapNode` to bridge → node starts automatically
@@ -16,6 +13,7 @@ use tokio::sync::mpsc;
 use crate::views::{chat, contacts, onboarding, profile, settings};
 use crate::{rpc_bridge, theme};
 use crate::rpc_bridge::{UiCommand, UiEvent};
+
 // ---------------------------------------------------------------------------
 // View enum
 // ---------------------------------------------------------------------------
@@ -57,7 +55,6 @@ pub struct BitevachatApp {
     current_view: View,
     connected: bool,
     onboarding: onboarding::OnboardingState,
-    /// True once the bootstrap command has been sent to the bridge.
     bootstrap_sent: bool,
     chat: chat::ChatState,
     contact: contacts::ContactState,
@@ -72,7 +69,6 @@ pub struct BitevachatApp {
 }
 
 impl BitevachatApp {
-    /// Creates the app. Called from the eframe creator closure.
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         cmd_tx: mpsc::Sender<UiCommand>,
@@ -99,7 +95,7 @@ impl BitevachatApp {
     }
 
     // -----------------------------------------------------------------------
-    // Event processing (non-blocking)
+    // Event processing
     // -----------------------------------------------------------------------
 
     fn process_events(&mut self, ctx: &egui::Context) {
@@ -118,6 +114,11 @@ impl BitevachatApp {
     fn handle_event(&mut self, event: UiEvent, ctx: &egui::Context) {
         match event {
             UiEvent::NodeStarted { address, rpc_endpoint } => {
+                tracing::info!(
+                    address = %address,
+                    endpoint = %rpc_endpoint,
+                    "node started"
+                );
                 self.chat.my_address = address.clone();
                 self.prof.profile.address = address;
                 self.setting.rpc_endpoint = rpc_endpoint;
@@ -125,15 +126,16 @@ impl BitevachatApp {
             }
 
             UiEvent::Connected => {
+                tracing::info!("RPC connected, switching to Chat view");
                 self.connected = true;
                 self.current_view = View::Chat;
                 self.add_toast("Connected", ToastLevel::Success);
-                // Initial data fetch.
                 let _ = self.cmd_tx.try_send(UiCommand::GetStatus);
                 let _ = self.cmd_tx.try_send(UiCommand::ListContacts);
             }
 
             UiEvent::Disconnected(reason) => {
+                tracing::warn!(reason = %reason, "disconnected");
                 self.connected = false;
                 self.add_toast(
                     &format!("Disconnected: {reason}"),
@@ -174,22 +176,92 @@ impl BitevachatApp {
                 self.chat.scroll_to_bottom = true;
             }
 
-            UiEvent::ContactList(contacts) => {
-                self.contact.contacts = contacts.clone();
-                self.chat.conversations = contacts
+            // ----- IMMEDIATE: single contact added -----
+            UiEvent::ContactAdded(contact) => {
+                tracing::info!(
+                    address = %contact.address,
+                    alias = %contact.alias,
+                    "ContactAdded event"
+                );
+
+                // Add to contacts list if not already present.
+                if !self
+                    .contact
+                    .contacts
                     .iter()
-                    .filter(|c| !c.blocked)
-                    .map(|c| chat::ConversationEntry {
-                        peer_address: c.address.clone(),
-                        alias: if c.alias.is_empty() {
+                    .any(|c| c.address == contact.address)
+                {
+                    self.contact.contacts.push(contact.clone());
+                }
+
+                // Add to chat conversations if not blocked.
+                if !contact.blocked {
+                    self.chat.ensure_conversation(
+                        &contact.address,
+                        if contact.alias.is_empty() {
                             None
                         } else {
-                            Some(c.alias.clone())
+                            Some(&contact.alias)
                         },
-                        last_message_time: String::new(),
-                        unread: false,
-                    })
-                    .collect();
+                    );
+                }
+            }
+
+            // ----- FULL LIST: merge with local state -----
+            UiEvent::ContactList(server_contacts) => {
+                tracing::info!(
+                    count = server_contacts.len(),
+                    "ContactList received"
+                );
+
+                // Update contacts tab with server data.
+                self.contact.contacts = server_contacts.clone();
+
+                // Build conversations from server contacts,
+                // but PRESERVE any locally-added entries.
+                let mut new_convos: Vec<chat::ConversationEntry> =
+                    server_contacts
+                        .iter()
+                        .filter(|c| !c.blocked)
+                        .map(|c| {
+                            let existing = self
+                                .chat
+                                .conversations
+                                .iter()
+                                .find(|conv| conv.peer_address == c.address);
+                            chat::ConversationEntry {
+                                peer_address: c.address.clone(),
+                                alias: if c.alias.is_empty() {
+                                    None
+                                } else {
+                                    Some(c.alias.clone())
+                                },
+                                last_message_time: existing
+                                    .map(|e| e.last_message_time.clone())
+                                    .unwrap_or_default(),
+                                unread: existing
+                                    .map(|e| e.unread)
+                                    .unwrap_or(false),
+                            }
+                        })
+                        .collect();
+
+                // Keep locally-added conversations not yet in server.
+                for local_convo in &self.chat.conversations {
+                    let in_server = new_convos
+                        .iter()
+                        .any(|c| c.peer_address == local_convo.peer_address);
+                    if !in_server {
+                        new_convos.push(local_convo.clone());
+                    }
+                }
+
+                self.chat.conversations = new_convos;
+
+                tracing::info!(
+                    convo_count = self.chat.conversations.len(),
+                    "conversations after merge"
+                );
             }
 
             UiEvent::PeerList(_peers) => {}
@@ -201,7 +273,8 @@ impl BitevachatApp {
             UiEvent::ProfileUpdated { avatar_cid, version } => {
                 self.prof.profile.avatar_cid = avatar_cid;
                 self.prof.profile.version = version;
-                self.prof.status_msg = "Profile updated successfully.".into();
+                self.prof.status_msg =
+                    "Profile updated successfully.".into();
                 self.prof.status_is_error = false;
             }
 
@@ -214,31 +287,33 @@ impl BitevachatApp {
                 message_id: _,
                 sender: _,
                 convo_id: _,
-            } => {
-                match event_type.as_str() {
-                    "message_received" => {
-                        self.add_toast("New message received", ToastLevel::Info);
-                        if let Some(ref convo) = self.chat.selected_convo {
-                            let _ = self.cmd_tx.try_send(UiCommand::ListMessages {
+            } => match event_type.as_str() {
+                "message_received" => {
+                    self.add_toast("New message received", ToastLevel::Info);
+                    if let Some(ref convo) = self.chat.selected_convo {
+                        let _ =
+                            self.cmd_tx.try_send(UiCommand::ListMessages {
                                 convo_id: convo.clone(),
                                 limit: 100,
                                 offset: 0,
                             });
-                        }
                     }
-                    "peer_connected" => {
-                        self.add_toast("Peer connected", ToastLevel::Info);
-                    }
-                    _ => {}
                 }
-            }
+                "peer_connected" => {
+                    self.add_toast("Peer connected", ToastLevel::Info);
+                }
+                _ => {}
+            },
 
             UiEvent::Error(msg) => {
+                tracing::error!(error = %msg, "bridge error");
                 self.add_toast(&msg, ToastLevel::Error);
-                // If bootstrap failed, allow user to retry.
-                if self.current_view == View::Onboarding && self.bootstrap_sent {
+                if self.current_view == View::Onboarding
+                    && self.bootstrap_sent
+                {
                     self.bootstrap_sent = false;
-                    self.onboarding.step = onboarding::OnboardingStep::Detect;
+                    self.onboarding.step =
+                        onboarding::OnboardingStep::Detect;
                     self.onboarding.result = None;
                 }
             }
@@ -283,8 +358,6 @@ impl BitevachatApp {
     // Bootstrap trigger
     // -----------------------------------------------------------------------
 
-    /// Sends the BootstrapNode command to the bridge once the
-    /// onboarding result is ready.
     fn try_send_bootstrap(&mut self) {
         if self.bootstrap_sent {
             return;
@@ -297,8 +370,35 @@ impl BitevachatApp {
             };
             let _ = self.cmd_tx.try_send(cmd);
             self.bootstrap_sent = true;
-            // Store data dir in settings.
-            self.setting.data_dir = result.data_dir.to_string_lossy().to_string();
+            self.setting.data_dir =
+                result.data_dir.to_string_lossy().to_string();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Handle "open chat" request from Contacts tab
+    // -----------------------------------------------------------------------
+
+    fn check_contacts_open_chat(&mut self) {
+        if let Some(addr) = self.contact.open_chat_addr.take() {
+            let alias = self.contact.open_chat_alias.take();
+            tracing::info!(
+                address = %addr,
+                "contacts tab → opening chat"
+            );
+
+            // Ensure conversation exists.
+            self.chat.ensure_conversation(
+                &addr,
+                alias.as_deref(),
+            );
+
+            // Select conversation.
+            self.chat
+                .select_conversation(addr, &self.cmd_tx);
+
+            // Switch to Chat view.
+            self.current_view = View::Chat;
         }
     }
 }
@@ -309,7 +409,7 @@ impl BitevachatApp {
 
 impl eframe::App for BitevachatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1) Process async events.
+        // 1) Process async events from bridge.
         self.process_events(ctx);
 
         // 2) Periodic poll.
@@ -321,10 +421,11 @@ impl eframe::App for BitevachatApp {
         // 4) Render toasts.
         render_toasts(&mut self.toasts, ctx);
 
-        // 5) Render current view.
+        // 5) Onboarding.
         if self.current_view == View::Onboarding {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let done = onboarding::render(&mut self.onboarding, ui);
+                let done =
+                    onboarding::render(&mut self.onboarding, ui);
                 if done {
                     self.try_send_bootstrap();
                 }
@@ -332,7 +433,7 @@ impl eframe::App for BitevachatApp {
             return;
         }
 
-        // Top bar with navigation.
+        // 6) Navigation bar.
         egui::TopBottomPanel::top("nav_bar").show(ctx, |ui| {
             render_nav_bar(
                 ui,
@@ -344,15 +445,21 @@ impl eframe::App for BitevachatApp {
             );
         });
 
-        // View-specific content.
+        // 7) Render current view.
         match self.current_view {
             View::Chat => {
                 chat::render(&mut self.chat, ctx, &self.cmd_tx);
             }
             View::Contacts => {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    contacts::render(&mut self.contact, ui, &self.cmd_tx);
+                    contacts::render(
+                        &mut self.contact,
+                        ui,
+                        &self.cmd_tx,
+                    );
                 });
+                // Check if contacts tab wants to open a chat.
+                self.check_contacts_open_chat();
             }
             View::Settings => {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -364,9 +471,7 @@ impl eframe::App for BitevachatApp {
                     profile::render(&mut self.prof, ui, &self.cmd_tx);
                 });
             }
-            View::Onboarding => {
-                // Handled above.
-            }
+            View::Onboarding => {}
         }
     }
 }
@@ -403,7 +508,9 @@ fn render_nav_bar(
         for (view, label) in &tabs {
             let selected = *current == *view;
             let text = if selected {
-                egui::RichText::new(*label).strong().color(theme::ACCENT)
+                egui::RichText::new(*label)
+                    .strong()
+                    .color(theme::ACCENT)
             } else {
                 egui::RichText::new(*label)
             };
@@ -411,38 +518,47 @@ fn render_nav_bar(
                 *current = *view;
                 match view {
                     View::Contacts => {
-                        let _ = cmd_tx.try_send(UiCommand::ListContacts);
+                        let _ =
+                            cmd_tx.try_send(UiCommand::ListContacts);
                     }
                     View::Profile => {
-                        let _ = cmd_tx.try_send(UiCommand::GetStatus);
+                        let _ =
+                            cmd_tx.try_send(UiCommand::GetStatus);
                     }
                     _ => {}
                 }
             }
         }
 
-        // Connection indicator (right side).
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if connected {
-                let state_str = status
-                    .as_ref()
-                    .map(|s| s.state.as_str())
-                    .unwrap_or("connected");
-                ui.colored_label(theme::SUCCESS, state_str);
+        ui.with_layout(
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                if connected {
+                    let state_str = status
+                        .as_ref()
+                        .map(|s| s.state.as_str())
+                        .unwrap_or("connected");
+                    ui.colored_label(theme::SUCCESS, state_str);
 
-                let pending = status.as_ref().map(|s| s.pending_count).unwrap_or(0);
-                if pending > 0 {
-                    ui.label(theme::muted(&format!("({pending} pending)")));
+                    let pending = status
+                        .as_ref()
+                        .map(|s| s.pending_count)
+                        .unwrap_or(0);
+                    if pending > 0 {
+                        ui.label(theme::muted(&format!(
+                            "({pending} pending)"
+                        )));
+                    }
+                } else {
+                    ui.colored_label(theme::DANGER, "disconnected");
+                    if ui.small_button("Reconnect").clicked() {
+                        let _ = cmd_tx.try_send(UiCommand::Connect {
+                            endpoint: rpc_endpoint.to_string(),
+                        });
+                    }
                 }
-            } else {
-                ui.colored_label(theme::DANGER, "disconnected");
-                if ui.small_button("Reconnect").clicked() {
-                    let _ = cmd_tx.try_send(UiCommand::Connect {
-                        endpoint: rpc_endpoint.to_string(),
-                    });
-                }
-            }
-        });
+            },
+        );
     });
 }
 

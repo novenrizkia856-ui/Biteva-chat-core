@@ -105,6 +105,10 @@ pub enum UiEvent {
         message_id: String,
     },
     Messages(Vec<MessageItem>),
+    /// Single contact was successfully added. Immediate feedback
+    /// so the UI can update locally without waiting for full list.
+    ContactAdded(ContactItem),
+    /// Full contact list from server.
     ContactList(Vec<ContactItem>),
     PeerList(Vec<PeerItem>),
     Profile(ProfileData),
@@ -194,8 +198,6 @@ pub fn create_channels() -> (
 // ---------------------------------------------------------------------------
 
 /// Runs the RPC bridge. Call this from a dedicated tokio runtime thread.
-///
-/// Never panics. All errors are forwarded to the UI as `UiEvent::Error`.
 pub async fn run_bridge(
     mut cmd_rx: mpsc::Receiver<UiCommand>,
     evt_tx: mpsc::Sender<UiEvent>,
@@ -218,7 +220,6 @@ pub async fn run_bridge(
                         ).await;
                     }
                     None => {
-                        // UI dropped the sender — exit.
                         break;
                     }
                 }
@@ -320,7 +321,6 @@ async fn handle_command(
                             let _ = evt_tx.send(UiEvent::Connected).await;
                         }
                         Err(e) => {
-                            // Retry once after a short delay.
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             match connect_to_node(&endpoint).await {
                                 Ok(clients) => {
@@ -343,7 +343,7 @@ async fn handle_command(
         }
 
         // ---------------------------------------------------------------
-        // Manual connect (for external node)
+        // Manual connect
         // ---------------------------------------------------------------
         UiCommand::Connect { endpoint } => {
             match connect_to_node(&endpoint).await {
@@ -471,13 +471,28 @@ async fn handle_command(
             }
         }
 
+        // ---------------------------------------------------------------
+        // AddContact: send ContactAdded immediately, THEN full refresh.
+        // ---------------------------------------------------------------
         UiCommand::AddContact { address, alias } => {
             let Some(ref mut clients) = connection else {
                 return;
             };
-            let req = proto::AddContactRequest { address, alias };
+            let req = proto::AddContactRequest {
+                address: address.clone(),
+                alias: alias.clone(),
+            };
             match clients.contact.add_contact(req).await {
                 Ok(_) => {
+                    // 1) Send immediate ContactAdded so UI updates instantly.
+                    let _ = evt_tx.send(UiEvent::ContactAdded(ContactItem {
+                        address: address.clone(),
+                        alias: alias.clone(),
+                        blocked: false,
+                    })).await;
+
+                    // 2) Small delay then full refresh from server.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     let req2 = proto::ListContactsRequest {};
                     if let Ok(resp) = clients.contact.list_contacts(req2).await {
                         let items: Vec<ContactItem> = resp
@@ -494,6 +509,13 @@ async fn handle_command(
                     }
                 }
                 Err(e) => {
+                    // Even on RPC error, send ContactAdded locally so the UI
+                    // doesn't lose the entry. The user can still chat.
+                    let _ = evt_tx.send(UiEvent::ContactAdded(ContactItem {
+                        address,
+                        alias,
+                        blocked: false,
+                    })).await;
                     let _ = evt_tx
                         .send(UiEvent::Error(format!(
                             "add contact: {}",
@@ -514,6 +536,21 @@ async fn handle_command(
                     .send(UiEvent::Error(format!("block: {}", e.message())))
                     .await;
             }
+            // Refresh contacts.
+            let req2 = proto::ListContactsRequest {};
+            if let Ok(resp) = clients.contact.list_contacts(req2).await {
+                let items: Vec<ContactItem> = resp
+                    .into_inner()
+                    .contacts
+                    .into_iter()
+                    .map(|c| ContactItem {
+                        address: c.address,
+                        alias: c.alias,
+                        blocked: c.blocked,
+                    })
+                    .collect();
+                let _ = evt_tx.send(UiEvent::ContactList(items)).await;
+            }
         }
 
         UiCommand::UnblockContact { address } => {
@@ -525,6 +562,21 @@ async fn handle_command(
                 let _ = evt_tx
                     .send(UiEvent::Error(format!("unblock: {}", e.message())))
                     .await;
+            }
+            // Refresh contacts.
+            let req2 = proto::ListContactsRequest {};
+            if let Ok(resp) = clients.contact.list_contacts(req2).await {
+                let items: Vec<ContactItem> = resp
+                    .into_inner()
+                    .contacts
+                    .into_iter()
+                    .map(|c| ContactItem {
+                        address: c.address,
+                        alias: c.alias,
+                        blocked: c.blocked,
+                    })
+                    .collect();
+                let _ = evt_tx.send(UiEvent::ContactList(items)).await;
             }
         }
 
@@ -646,9 +698,7 @@ async fn handle_command(
                             .await;
                     }
                 }
-                Err(_) => {
-                    // Avatar fetch failure is non-critical.
-                }
+                Err(_) => {}
             }
         }
 
@@ -658,7 +708,7 @@ async fn handle_command(
                 let _ = clients.node.shutdown(req).await;
             }
             *connection = None;
-            *bootstrap = None; // drops BootstrapInfo → signals RPC shutdown
+            *bootstrap = None;
             let _ = evt_tx
                 .send(UiEvent::Disconnected("node shut down".into()))
                 .await;
@@ -685,8 +735,6 @@ async fn poll_status(clients: &mut RpcClients, evt_tx: &mpsc::Sender<UiEvent>) {
             };
             let _ = evt_tx.send(UiEvent::Status(status)).await;
         }
-        Err(_) => {
-            // Polling failure is silent.
-        }
+        Err(_) => {}
     }
 }
