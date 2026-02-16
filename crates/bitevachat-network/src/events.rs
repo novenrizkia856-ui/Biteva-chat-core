@@ -5,7 +5,7 @@
 //! into this enum before being delivered to higher layers.
 
 use bitevachat_protocol::message::MessageEnvelope;
-use bitevachat_types::MessageId;
+use bitevachat_types::{Address, MessageId};
 use libp2p::PeerId;
 
 use crate::nat::NatStatus;
@@ -29,6 +29,19 @@ pub enum NetworkEvent {
 
     /// A remote peer connected to this node.
     PeerConnected(PeerId),
+
+    /// A peer's Bitevachat address was resolved via the Identify
+    /// protocol and added to the local address book.
+    ///
+    /// This fires AFTER `PeerConnected` once the identify handshake
+    /// completes. Higher layers use this to flush pending messages
+    /// for the newly-reachable address.
+    PeerAddressResolved {
+        /// The Bitevachat address that was resolved.
+        address: Address,
+        /// The libp2p PeerId associated with this address.
+        peer_id: PeerId,
+    },
 
     /// A remote peer disconnected from this node.
     PeerDisconnected(PeerId),

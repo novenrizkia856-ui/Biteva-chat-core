@@ -93,6 +93,13 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
             // 2. Process network events emitted by the swarm.
             // ---------------------------------------------------------------
             Some(net_event) = rt.network_rx.recv() => {
+                // Check if this event signals a newly-reachable peer
+                // BEFORE the event is consumed by the handler.
+                let flush_pending = matches!(
+                    &net_event,
+                    NetworkEvent::PeerAddressResolved { .. }
+                );
+
                 handle_network_event(
                     net_event,
                     &rt.spam_filter,
@@ -101,6 +108,13 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
                     &rt.pending_queue,
                     &rt.event_tx,
                 ).await;
+
+                // Immediately attempt delivery of pending messages
+                // whose backoff was just reset.  This avoids waiting
+                // up to 30 seconds for the next pending tick.
+                if flush_pending {
+                    handle_pending_tick(&mut rt);
+                }
             }
 
             // ---------------------------------------------------------------
@@ -206,6 +220,33 @@ async fn handle_network_event(
             let _ = event_tx
                 .send(NodeEvent::PeerConnected { node_id })
                 .await;
+        }
+
+        NetworkEvent::PeerAddressResolved { address, peer_id } => {
+            tracing::info!(
+                %address,
+                %peer_id,
+                "peer address resolved — will flush pending messages"
+            );
+
+            // Reset exponential backoff for all pending messages
+            // destined for this address.  Without this, messages
+            // accumulated while the peer was offline would sit in
+            // backoff (potentially minutes to hours) even though
+            // the peer is now reachable.
+            match pending_queue.reset_backoff_for_recipient(&address) {
+                Ok(n) if n > 0 => {
+                    tracing::info!(
+                        %address,
+                        count = n,
+                        "reset backoff for pending messages"
+                    );
+                }
+                Ok(_) => {} // no pending messages for this address
+                Err(e) => {
+                    tracing::warn!(%e, %address, "failed to reset pending backoff");
+                }
+            }
         }
 
         NetworkEvent::PeerDisconnected(peer_id) => {
@@ -785,32 +826,81 @@ fn handle_pending_tick(
     tracing::debug!(count = ready.len(), "pending tick: retrying messages");
 
     // 3. Attempt delivery for each ready entry.
+    //
+    //    CRITICAL: We must rebuild the envelope with a fresh timestamp
+    //    and re-sign it.  The original envelope's timestamp may be
+    //    minutes or hours old, and the receiver will reject it with
+    //    `InvalidTimestamp` if it exceeds the ±5 minute skew window.
+    //
+    //    Since `payload_ciphertext` currently stores plaintext (E2E
+    //    encryption not yet wired), we can extract it directly and
+    //    rebuild via `outgoing::build_outgoing_envelope`.
     for entry in &ready {
-        let msg_id = *entry.message_id();
+        let old_msg_id = *entry.message_id();
 
+        // Extract the original plaintext and metadata from the stale
+        // envelope so we can rebuild with a fresh timestamp.
+        let plaintext = &entry.envelope.message.payload_ciphertext;
+        let recipient = entry.recipient;
+        let payload_type = entry.envelope.message.payload_type;
+        let shared_key = [0u8; 32]; // placeholder; E2E not yet wired
+
+        // Rebuild with fresh timestamp + nonce + signature.
+        let (fresh_envelope, fresh_msg_id) = match outgoing::build_outgoing_envelope(
+            &rt.wallet,
+            recipient,
+            plaintext,
+            payload_type,
+            &shared_key,
+            rt.node_id,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(
+                    %e, %old_msg_id,
+                    "pending retry: failed to rebuild envelope, skipping"
+                );
+                let _ = rt.pending_queue.mark_failed(&old_msg_id, &Timestamp::now());
+                continue;
+            }
+        };
+
+        // Atomically replace the stale envelope in the pending queue
+        // so that mark_delivered / mark_failed can find it by the new
+        // message_id after the ACK or failure arrives.
+        if let Err(e) = rt.pending_queue.replace_envelope(&old_msg_id, fresh_envelope.clone()) {
+            tracing::warn!(
+                %e, %old_msg_id,
+                "pending retry: failed to replace envelope in queue"
+            );
+            continue;
+        }
+
+        // Attempt delivery with the fresh envelope.
         match rt.network.try_deliver_to_address(
-            &entry.recipient,
-            entry.envelope.clone(),
-            msg_id,
+            &recipient,
+            fresh_envelope,
+            fresh_msg_id,
         ) {
             Ok(()) => {
                 // Delivery dispatched — the ACK handler
                 // (NetworkEvent::DeliveryAck) will call
-                // pending_queue.mark_delivered() when the
+                // pending_queue.mark_delivered(fresh_msg_id) when the
                 // recipient acknowledges receipt.
                 tracing::debug!(
-                    %msg_id,
-                    recipient = %entry.recipient,
-                    "pending retry: dispatched to connected peer"
+                    %fresh_msg_id,
+                    %old_msg_id,
+                    %recipient,
+                    "pending retry: dispatched with fresh timestamp"
                 );
             }
             Err(e) => {
                 // Peer not known or not connected — bump retry count
                 // so exponential backoff kicks in.
                 let fail_now = Timestamp::now();
-                let _ = rt.pending_queue.mark_failed(&msg_id, &fail_now);
+                let _ = rt.pending_queue.mark_failed(&fresh_msg_id, &fail_now);
                 tracing::debug!(
-                    %msg_id,
+                    %fresh_msg_id,
                     %e,
                     retry = entry.retry_count + 1,
                     "pending retry: delivery failed, will backoff"

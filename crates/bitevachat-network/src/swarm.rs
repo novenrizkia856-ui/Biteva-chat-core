@@ -556,7 +556,7 @@ impl BitevachatSwarm {
     async fn handle_behaviour_event(&mut self, event: BitevachatBehaviourEvent) {
         match event {
             BitevachatBehaviourEvent::Discovery(disc) => {
-                handle_discovery_event(disc, &mut self.address_book);
+                handle_discovery_event(disc, &mut self.address_book, &self.event_sender);
             }
             BitevachatBehaviourEvent::Messaging(msg_event) => {
                 self.handle_messaging_event(msg_event).await;
@@ -730,13 +730,17 @@ impl BitevachatSwarm {
 // Discovery event handlers (logging)
 // ---------------------------------------------------------------------------
 
-fn handle_discovery_event(event: DiscoveryBehaviourEvent, address_book: &mut HashMap<[u8; 32], PeerId>) {
+fn handle_discovery_event(
+    event: DiscoveryBehaviourEvent,
+    address_book: &mut HashMap<[u8; 32], PeerId>,
+    event_sender: &mpsc::UnboundedSender<NetworkEvent>,
+) {
     match event {
         DiscoveryBehaviourEvent::Kademlia(kad_event) => {
             handle_kademlia_event(kad_event);
         }
         DiscoveryBehaviourEvent::Identify(id_event) => {
-            handle_identify_event(id_event, address_book);
+            handle_identify_event(id_event, address_book, event_sender);
         }
     }
 }
@@ -803,7 +807,11 @@ fn handle_kademlia_event(event: kad::Event) {
     }
 }
 
-fn handle_identify_event(event: identify::Event, address_book: &mut HashMap<[u8; 32], PeerId>) {
+fn handle_identify_event(
+    event: identify::Event,
+    address_book: &mut HashMap<[u8; 32], PeerId>,
+    event_sender: &mpsc::UnboundedSender<NetworkEvent>,
+) {
     match event {
         identify::Event::Received { peer_id, info, .. } => {
             tracing::info!(
@@ -826,6 +834,13 @@ fn handle_identify_event(event: identify::Event, address_book: &mut HashMap<[u8;
                     %address,
                     "identify: mapped peer address in address book"
                 );
+
+                // Notify higher layers so they can flush pending
+                // messages for this newly-reachable address.
+                let _ = event_sender.send(NetworkEvent::PeerAddressResolved {
+                    address,
+                    peer_id,
+                });
             }
         }
         identify::Event::Sent { peer_id, .. } => {

@@ -228,6 +228,73 @@ impl PendingQueue {
         self.persist(&entries)
     }
 
+    /// Resets the backoff for all pending entries destined for a
+    /// specific recipient.
+    ///
+    /// Called when a peer reconnects (identify completed) so that
+    /// pending messages are immediately eligible for delivery on
+    /// the next `dequeue_ready` call, regardless of how many
+    /// previous retry failures they accumulated while the peer was
+    /// offline.
+    ///
+    /// # Parameters
+    ///
+    /// - `recipient` — the address whose entries should be reset.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries that were reset.
+    pub fn reset_backoff_for_recipient(&self, recipient: &Address) -> Result<u64> {
+        let mut entries = self.lock_entries()?;
+        let mut count = 0u64;
+
+        for entry in entries.iter_mut() {
+            if entry.recipient.as_bytes() == recipient.as_bytes() {
+                entry.retry_count = 0;
+                entry.last_attempt = None;
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            self.persist(&entries)?;
+        }
+
+        Ok(count)
+    }
+
+    /// Replaces the envelope of a pending entry identified by its
+    /// current message ID.
+    ///
+    /// Used when retrying a message: the old envelope has a stale
+    /// timestamp that would be rejected by the receiver's skew check,
+    /// so the caller rebuilds it with a fresh timestamp and signature.
+    /// After replacement, `entry.message_id()` returns the new
+    /// message ID (derived from the new envelope).
+    ///
+    /// # Parameters
+    ///
+    /// - `old_msg_id` — the current message ID to locate the entry.
+    /// - `new_envelope` — the freshly-built envelope to store.
+    pub fn replace_envelope(
+        &self,
+        old_msg_id: &MessageId,
+        new_envelope: MessageEnvelope,
+    ) -> Result<()> {
+        let mut entries = self.lock_entries()?;
+
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.message_id().as_bytes() == old_msg_id.as_bytes())
+            .ok_or_else(|| BitevachatError::StorageError {
+                reason: "message not found in pending queue for envelope replacement".into(),
+            })?;
+
+        entry.envelope = new_envelope;
+
+        self.persist(&entries)
+    }
+
     /// Purges entries whose TTL has expired.
     ///
     /// An entry is expired if `now - created_at > ttl_days`.
