@@ -43,6 +43,14 @@ service ProfileService {
   rpc GetAvatar(GetAvatarRequest) returns (GetAvatarResponse);
 }
 
+// ---------------------------------------------------------------------------
+// EventService -- server-streaming events for GUI / CLI consumers
+// ---------------------------------------------------------------------------
+
+service EventService {
+  rpc SubscribeEvents(SubscribeEventsRequest) returns (stream EventNotification);
+}
+
 // ===========================================================================
 // Message types
 // ===========================================================================
@@ -191,4 +199,20 @@ message GetAvatarRequest {
 message GetAvatarResponse {
   bool found = 1;
   bytes data = 2;
+}
+
+// ----- EventService messages ----------------------------------------------
+
+message SubscribeEventsRequest {}
+
+message EventNotification {
+  // One of: "message_received", "delivery_ack", "peer_connected",
+  //         "peer_disconnected", "profile_updated"
+  string event_type = 1;
+  string convo_id = 2;
+  string message_id = 3;
+  string sender = 4;
+  string node_id = 5;
+  string address = 6;
+  string timestamp = 7;
 }

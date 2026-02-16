@@ -10,6 +10,20 @@ description = "Desktop GUI for Bitevachat (egui + optional Tauri)"
 name = "bitevachat-gui"
 path = "src/main.rs"
 
+[lib]
+name = "bitevachat_gui"
+path = "src/lib.rs"
+
 [dependencies]
-bitevachat-types = { path = "../bitevachat-types" }
-bitevachat-rpc = { path = "../bitevachat-rpc" }
+eframe = "0.28"
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+rand = "0.8"
+
+[build-dependencies]
+tonic-build = "0.12"
