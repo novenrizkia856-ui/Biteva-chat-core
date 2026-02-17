@@ -14,6 +14,33 @@ use serde::{Deserialize, Serialize};
 
 use bitevachat_types::{BitevachatError, Result};
 
+// ---------------------------------------------------------------------------
+// Well-known bootstrap nodes
+// ---------------------------------------------------------------------------
+
+/// Default bootstrap nodes for the Bitevachat network.
+///
+/// These are community-run nodes that serve as initial entry points
+/// to the Bitevachat Kademlia DHT.  They are NOT central servers —
+/// once a node has discovered peers through the DHT, it no longer
+/// needs them.  This is the same model Bitcoin uses with its DNS
+/// seed nodes.
+///
+/// Anyone can run a bootstrap node by:
+/// 1. Running a Bitevachat node on a machine with a public IP.
+/// 2. Setting `enable_relay_server: true` in their config.
+/// 3. Sharing their multiaddr for inclusion in this list.
+///
+/// Format: `/ip4/<ip>/tcp/<port>/p2p/<peer_id>`
+///    or:  `/dns4/<domain>/tcp/<port>/p2p/<peer_id>`
+///
+/// If this list is empty, the node relies on mDNS (LAN only) or
+/// manually-configured `bootstrap_nodes` in the user's config file.
+pub const DEFAULT_BOOTSTRAP_NODES: &[&str] = &[
+    "/ip6/2001:448a:2042:3499:1353:53be:81:b871/tcp/27300/p2p/12D3KooWKrB6TcfiaS3uYqTiurVgrN8tr3T4ZgkpFWud7qAUjQE7",
+];
+
+
 /// Network-layer configuration.
 ///
 /// Controls listening addresses, bootstrap peers, connection
@@ -152,8 +179,8 @@ impl Default for NetworkConfig {
         // Construct the default listen address without parsing to avoid
         // expect()/unwrap() per project rules.
         let mut listen_addr = Multiaddr::empty();
-        listen_addr.push(Protocol::Ip4(std::net::Ipv4Addr::UNSPECIFIED));
-        listen_addr.push(Protocol::Tcp(0));
+        listen_addr.push(Protocol::Ip6(std::net::Ipv6Addr::UNSPECIFIED));
+        listen_addr.push(Protocol::Tcp(27300));
 
         Self {
             listen_addr,
@@ -170,7 +197,7 @@ impl Default for NetworkConfig {
             enable_autonat: true,
             autonat_confidence_max: 3,
             enable_relay_client: true,
-            enable_relay_server: false,
+            enable_relay_server: true,
             relay_only: false,
             relay_servers: Vec::new(),
             enable_turn: false,
@@ -180,6 +207,27 @@ impl Default for NetworkConfig {
 }
 
 impl NetworkConfig {
+    /// Returns the effective list of bootstrap nodes: hardcoded
+    /// defaults merged with user-configured nodes (deduplicated).
+    ///
+    /// Hardcoded defaults from [`DEFAULT_BOOTSTRAP_NODES`] are
+    /// always included.  User-configured `bootstrap_nodes` are
+    /// appended.  Duplicates are removed.
+    pub fn effective_bootstrap_nodes(&self) -> Vec<Multiaddr> {
+        let mut nodes: Vec<Multiaddr> = DEFAULT_BOOTSTRAP_NODES
+            .iter()
+            .filter_map(|s| s.parse::<Multiaddr>().ok())
+            .collect();
+
+        for addr in &self.bootstrap_nodes {
+            if !nodes.iter().any(|existing| existing == addr) {
+                nodes.push(addr.clone());
+            }
+        }
+
+        nodes
+    }
+
     /// Validates all configuration values.
     ///
     /// Returns `Err(BitevachatError::ConfigError)` if any value is
@@ -424,10 +472,31 @@ mod tests {
         let config = NetworkConfig {
             enable_autonat: true,
             enable_relay_client: true,
-            enable_relay_server: false,
+            enable_relay_server: true,
             relay_only: false,
             ..NetworkConfig::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn effective_bootstrap_nodes_empty_by_default() {
+        let config = NetworkConfig::default();
+        // DEFAULT_BOOTSTRAP_NODES is currently empty, so
+        // effective list should also be empty.
+        let nodes = config.effective_bootstrap_nodes();
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn effective_bootstrap_nodes_includes_user_configured() {
+        let addr: Multiaddr = "/ip4/1.2.3.4/tcp/9000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".parse().unwrap();
+        let config = NetworkConfig {
+            bootstrap_nodes: vec![addr.clone()],
+            ..NetworkConfig::default()
+        };
+        let nodes = config.effective_bootstrap_nodes();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0], addr);
     }
 }

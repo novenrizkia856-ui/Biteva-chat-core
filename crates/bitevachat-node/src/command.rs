@@ -202,6 +202,32 @@ pub enum NodeCommand {
         reply: oneshot::Sender<BResult<Option<SignedProfile>>>,
     },
 
+    // ----- Network operations ---------------------------------------------
+
+    /// Manually dial a peer by multiaddr.
+    ///
+    /// Used to connect to a specific peer when mDNS and DHT
+    /// discovery are insufficient (e.g. a friend shares their
+    /// multiaddr for a direct internet connection).
+    DialPeer {
+        /// Full multiaddr including `/p2p/<peer_id>`, e.g.
+        /// `/ip4/203.0.113.1/tcp/9000/p2p/12D3KooW...`
+        addr: libp2p::Multiaddr,
+        /// Reply channel.
+        reply: oneshot::Sender<BResult<()>>,
+    },
+
+    /// Add a bootstrap node and trigger Kademlia bootstrap.
+    ///
+    /// Adds the node to the Kademlia routing table and initiates
+    /// a bootstrap query to discover nearby peers.
+    AddBootstrapNode {
+        /// Full multiaddr including `/p2p/<peer_id>`.
+        addr: libp2p::Multiaddr,
+        /// Reply channel.
+        reply: oneshot::Sender<BResult<()>>,
+    },
+
     /// Initiate graceful shutdown.
     Shutdown,
 }
@@ -248,14 +274,20 @@ impl std::fmt::Debug for NodeCommand {
             Self::GetStatus { .. } => f.write_str("GetStatus"),
             Self::ListPeers { .. } => f.write_str("ListPeers"),
             Self::InjectMessage { .. } => f.write_str("InjectMessage"),
-            Self::UpdateProfile { name, .. } => {
-                f.debug_struct("UpdateProfile")
-                    .field("name", name)
-                    .finish_non_exhaustive()
-            }
+            Self::UpdateProfile { .. } => f.write_str("UpdateProfile"),
             Self::GetProfile { address, .. } => {
                 f.debug_struct("GetProfile")
                     .field("address", address)
+                    .finish_non_exhaustive()
+            }
+            Self::DialPeer { addr, .. } => {
+                f.debug_struct("DialPeer")
+                    .field("addr", addr)
+                    .finish_non_exhaustive()
+            }
+            Self::AddBootstrapNode { addr, .. } => {
+                f.debug_struct("AddBootstrapNode")
+                    .field("addr", addr)
                     .finish_non_exhaustive()
             }
             Self::Shutdown => f.write_str("Shutdown"),

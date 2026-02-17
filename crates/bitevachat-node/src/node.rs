@@ -108,6 +108,7 @@ pub(crate) struct NodeRuntime {
     pub config: AppConfig,
     pub node_id: NodeId,
     pub listen_addr: libp2p::Multiaddr,
+    pub bootstrap_nodes: Vec<libp2p::Multiaddr>,
     pub event_tx: mpsc::Sender<NodeEvent>,
     pub command_rx: mpsc::Receiver<NodeCommand>,
     pub shutdown_rx: watch::Receiver<bool>,
@@ -217,6 +218,7 @@ impl Node {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let listen_addr = net_config.listen_addr.clone();
+        let bootstrap_nodes = net_config.effective_bootstrap_nodes();
 
         // Initialize anti-spam filter from config.
         let spam_config = crate::spam_filter::SpamConfig::from(&app_config);
@@ -232,6 +234,7 @@ impl Node {
             config: app_config,
             node_id,
             listen_addr,
+            bootstrap_nodes,
             event_tx,
             command_rx,
             shutdown_rx,
