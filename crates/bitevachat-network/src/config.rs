@@ -37,7 +37,8 @@ use bitevachat_types::{BitevachatError, Result};
 /// If this list is empty, the node relies on mDNS (LAN only) or
 /// manually-configured `bootstrap_nodes` in the user's config file.
 pub const DEFAULT_BOOTSTRAP_NODES: &[&str] = &[
-    "/ip6/2001:448a:2042:3499:1353:53be:81:b871/tcp/27300/p2p/12D3KooWKrB6TcfiaS3uYqTiurVgrN8tr3T4ZgkpFWud7qAUjQE7",
+    "/ip4/82.25.62.154/tcp/9000/p2p/12D3KooWJdorLfGhEBJeEYKnfox4ppPBMD6CCzvX1GB73NqgAc7A
+",
 ];
 
 
