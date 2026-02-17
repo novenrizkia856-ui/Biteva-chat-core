@@ -1,0 +1,8 @@
+{
+    "data_dir": "/opt/bitevachat/data",
+    "listen_addr": "/ip4/0.0.0.0/tcp/9000",
+    "rpc_port": 50051,
+    "relay_server": true,
+    "enable_mdns": false,
+    "bootstrap_nodes": []
+}

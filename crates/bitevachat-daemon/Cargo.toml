@@ -1,0 +1,32 @@
+[package]
+name = "bitevachat-daemon"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Headless Bitevachat node daemon for servers and VPS"
+
+[[bin]]
+name = "bitevachat-daemon"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+bip39 = "2"
+rand = "0.8"
+hex = "0.4"
+libp2p = { version = "0.54", default-features = false }
+
+# Workspace crates
+bitevachat-types = { path = "../bitevachat-types" }
+bitevachat-crypto = { path = "../bitevachat-crypto" }
+bitevachat-wallet = { path = "../bitevachat-wallet" }
+bitevachat-storage = { path = "../bitevachat-storage" }
+bitevachat-network = { path = "../bitevachat-network" }
+bitevachat-node = { path = "../bitevachat-node" }
+bitevachat-rpc = { path = "../bitevachat-rpc" }

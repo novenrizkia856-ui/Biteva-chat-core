@@ -11,6 +11,7 @@ members = [
     "crates/bitevachat-node",
     "crates/bitevachat-cli",
     "crates/bitevachat-gui",
+    "crates/bitevachat-daemon",
 ]
 
 [workspace.package]
