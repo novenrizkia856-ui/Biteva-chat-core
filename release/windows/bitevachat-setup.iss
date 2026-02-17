@@ -13,6 +13,7 @@
 ;     bitevachat.exe
 ;     bitevachat-gui.exe
 ;     bitevachat-node.exe
+;     bitevachat-daemon.exe
 ;
 ; ==========================================================================
 
@@ -58,6 +59,7 @@ Name: "launchstartup"; Description: "Start Bitevachat when Windows starts"; Grou
 [Files]
 Source: "bin\bitevachat-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "bin\bitevachat-node.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "bin\bitevachat-daemon.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "bin\bitevachat.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "files\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "files\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
@@ -81,6 +83,7 @@ var
 begin
   Exec('taskkill.exe', '/F /IM bitevachat-gui.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec('taskkill.exe', '/F /IM bitevachat-node.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill.exe', '/F /IM bitevachat-daemon.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec('taskkill.exe', '/F /IM bitevachat.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 

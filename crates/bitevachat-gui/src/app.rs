@@ -2,8 +2,8 @@
 //!
 //! Startup flow:
 //! 1. Onboarding (detect wallet / create / import / unlock)
-//! 2. Send `BootstrapNode` to bridge → node starts automatically
-//! 3. Bridge auto-connects to embedded RPC → Chat view
+//! 2. Send `BootstrapNode` to bridge -> node starts automatically
+//! 3. Bridge auto-connects to embedded RPC -> Chat view
 
 use std::time::{Duration, Instant};
 
@@ -66,6 +66,9 @@ pub struct BitevachatApp {
     toasts: Vec<Toast>,
     poll_timer: Instant,
     initial_fetch_done: bool,
+    /// Tracks whether a ListMessages request is currently in-flight
+    /// to avoid duplicate requests that cause flickering.
+    messages_request_pending: bool,
 }
 
 impl BitevachatApp {
@@ -91,6 +94,7 @@ impl BitevachatApp {
             toasts: Vec::new(),
             poll_timer: Instant::now(),
             initial_fetch_done: false,
+            messages_request_pending: false,
         }
     }
 
@@ -162,18 +166,29 @@ impl BitevachatApp {
             UiEvent::MessageSent { message_id } => {
                 self.chat.last_sent_id = Some(message_id);
                 self.chat.scroll_to_bottom = true;
-                if let Some(ref convo) = self.chat.selected_convo {
-                    let _ = self.cmd_tx.try_send(UiCommand::ListMessages {
-                        convo_id: convo.clone(),
-                        limit: 100,
-                        offset: 0,
-                    });
-                }
+                // Fetch updated message list.
+                self.request_messages();
             }
 
             UiEvent::Messages(msgs) => {
-                self.chat.messages = msgs;
-                self.chat.scroll_to_bottom = true;
+                // Clear in-flight flag so next poll can request again.
+                self.messages_request_pending = false;
+
+                // Clear switching flag -- fresh messages have arrived.
+                self.chat.switching_convo = false;
+
+                // FIX: Only update messages if content actually changed.
+                // This prevents flicker from identical poll responses.
+                if !messages_equal(&self.chat.messages, &msgs) {
+                    let had_fewer = msgs.len() > self.chat.messages.len();
+                    self.chat.messages = msgs;
+
+                    // FIX: Only auto-scroll when NEW messages arrive,
+                    // not on every identical poll response.
+                    if had_fewer {
+                        self.chat.scroll_to_bottom = true;
+                    }
+                }
             }
 
             // ----- IMMEDIATE: single contact added -----
@@ -290,14 +305,8 @@ impl BitevachatApp {
             } => match event_type.as_str() {
                 "message_received" => {
                     self.add_toast("New message received", ToastLevel::Info);
-                    if let Some(ref convo) = self.chat.selected_convo {
-                        let _ =
-                            self.cmd_tx.try_send(UiCommand::ListMessages {
-                                convo_id: convo.clone(),
-                                limit: 100,
-                                offset: 0,
-                            });
-                    }
+                    // FIX: Only request if not already pending.
+                    self.request_messages();
                 }
                 "peer_connected" => {
                     self.add_toast("Peer connected", ToastLevel::Info);
@@ -332,6 +341,27 @@ impl BitevachatApp {
     }
 
     // -----------------------------------------------------------------------
+    // Deduplicated message request
+    // -----------------------------------------------------------------------
+
+    /// Sends a ListMessages request ONLY if one is not already in-flight.
+    /// Prevents duplicate requests from poll + notification + send
+    /// that cause flickering.
+    fn request_messages(&mut self) {
+        if self.messages_request_pending {
+            return;
+        }
+        if let Some(ref convo) = self.chat.selected_convo {
+            let _ = self.cmd_tx.try_send(UiCommand::ListMessages {
+                convo_id: convo.clone(),
+                limit: 100,
+                offset: 0,
+            });
+            self.messages_request_pending = true;
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Periodic polling
     // -----------------------------------------------------------------------
 
@@ -345,13 +375,8 @@ impl BitevachatApp {
         self.poll_timer = Instant::now();
         let _ = self.cmd_tx.try_send(UiCommand::GetStatus);
 
-        if let Some(ref convo) = self.chat.selected_convo {
-            let _ = self.cmd_tx.try_send(UiCommand::ListMessages {
-                convo_id: convo.clone(),
-                limit: 100,
-                offset: 0,
-            });
-        }
+        // FIX: Use deduplicated request instead of direct send.
+        self.request_messages();
     }
 
     // -----------------------------------------------------------------------
@@ -384,7 +409,7 @@ impl BitevachatApp {
             let alias = self.contact.open_chat_alias.take();
             tracing::info!(
                 address = %addr,
-                "contacts tab → opening chat"
+                "contacts tab -> opening chat"
             );
 
             // Ensure conversation exists.
@@ -401,6 +426,25 @@ impl BitevachatApp {
             self.current_view = View::Chat;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Message equality check (avoids unnecessary re-renders)
+// ---------------------------------------------------------------------------
+
+/// Compares two message lists by message_id to detect actual changes.
+/// Much cheaper than deep comparison and prevents flicker from
+/// identical poll responses.
+fn messages_equal(
+    a: &[rpc_bridge::MessageItem],
+    b: &[rpc_bridge::MessageItem],
+) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| x.message_id == y.message_id)
 }
 
 // ---------------------------------------------------------------------------

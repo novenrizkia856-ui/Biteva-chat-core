@@ -15,7 +15,7 @@ name = "bitevachat_gui"
 path = "src/lib.rs"
 
 [dependencies]
-eframe = "0.28"
+eframe = "0.29"
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }

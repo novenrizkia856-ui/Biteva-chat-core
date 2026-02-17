@@ -40,6 +40,10 @@ pub struct ChatState {
     pub new_chat_error: String,
     /// Copy-to-clipboard feedback timer.
     pub copy_feedback_until: Option<std::time::Instant>,
+    /// True while waiting for messages after switching to a different
+    /// conversation.  Prevents showing stale messages from the
+    /// previous chat.
+    pub switching_convo: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +69,7 @@ impl ChatState {
             new_chat_alias: String::new(),
             new_chat_error: String::new(),
             copy_feedback_until: None,
+            switching_convo: false,
         }
     }
 
@@ -74,10 +79,33 @@ impl ChatState {
         addr: String,
         cmd_tx: &tokio::sync::mpsc::Sender<UiCommand>,
     ) {
+        let is_same = self
+            .selected_convo
+            .as_ref()
+            .map(|s| s == &addr)
+            .unwrap_or(false);
+
+        // If already viewing this conversation, just refresh.
+        if is_same {
+            let _ = cmd_tx.try_send(UiCommand::ListMessages {
+                convo_id: addr,
+                limit: 100,
+                offset: 0,
+            });
+            return;
+        }
+
         tracing::info!(address = %addr, "selecting conversation");
         self.selected_convo = Some(addr.clone());
-        self.messages.clear();
+
+        // FIX: Don't clear messages immediately. Keep stale messages
+        // visible until the server responds with new ones.  This
+        // prevents the blank-screen flash on conversation switch.
+        // The `switching_convo` flag tells the renderer to show a
+        // subtle loading indicator instead of the stale messages.
+        self.switching_convo = true;
         self.scroll_to_bottom = true;
+
         let _ = cmd_tx.try_send(UiCommand::ListMessages {
             convo_id: addr,
             limit: 100,
@@ -512,7 +540,7 @@ fn render_new_chat_dialog(
 fn render_messages(state: &mut ChatState, ui: &mut egui::Ui, max_height: f32) {
     let scroll_id = egui::Id::new("chat_messages_scroll");
     let mut scroll = egui::ScrollArea::vertical()
-        .id_source(scroll_id)
+        .id_salt(scroll_id)
         .max_height(max_height)
         .auto_shrink([false, false])
         .stick_to_bottom(true);
@@ -524,6 +552,16 @@ fn render_messages(state: &mut ChatState, ui: &mut egui::Ui, max_height: f32) {
 
     scroll.show(ui, |ui: &mut egui::Ui| {
         ui.add_space(theme::PANEL_PADDING);
+
+        // While switching conversations, show a brief loading state
+        // instead of stale messages from the previous chat.
+        if state.switching_convo {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(theme::muted("Loading messages..."));
+            });
+            return;
+        }
 
         if state.messages.is_empty() {
             ui.vertical_centered(|ui| {
