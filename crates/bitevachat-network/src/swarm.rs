@@ -2,16 +2,31 @@
 //!
 //! [`BitevachatSwarm`] encapsulates the libp2p `Swarm` with the
 //! combined [`BitevachatBehaviour`] and provides an async event loop
-//! for message routing, gossip, and DHT discovery.
+//! for message routing, gossip, DHT discovery, **and relay-based
+//! NAT traversal**.
+//!
+//! # Relay architecture
+//!
+//! ```text
+//! Client A (NAT)            VPS (relay server)         Client B (NAT)
+//!   relay_client  ---------> relay::Behaviour <--------- relay_client
+//!   listen /p2p-circuit      accept circuits             listen /p2p-circuit
+//!   autonat                  autonat                     autonat
+//!   dcutr (hole punch)       dcutr                       dcutr (hole punch)
+//! ```
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
+use libp2p::autonat;
+use libp2p::dcutr;
 use libp2p::gossipsub;
 use libp2p::mdns;
+use libp2p::relay;
 use libp2p::request_response::{self, ProtocolSupport};
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, kad, noise, yamux, Multiaddr, PeerId, Swarm};
 
@@ -30,7 +45,9 @@ use crate::events::NetworkEvent;
 use crate::gossip::{self, subscribe_default_topics};
 use crate::handler::{MessageHandler, DEFAULT_MAX_TIMESTAMP_SKEW_SECS};
 use crate::identity::wallet_keypair_to_libp2p;
+use crate::nat::NatManager;
 use crate::protocol::{Ack, WireMessage, MSG_PROTOCOL};
+use crate::relay as relay_helpers;
 use crate::routing::{build_wire_message, DeliveryStatus, Router};
 use crate::transport;
 
@@ -44,11 +61,6 @@ type BResult<T> = std::result::Result<T, BitevachatError>;
 
 /// Combined libp2p behaviour for Bitevachat.
 ///
-/// Composes:
-/// - [`DiscoveryBehaviour`] — Kademlia DHT + Identify.
-/// - `cbor::Behaviour<WireMessage, Ack>` — direct messaging via CBOR.
-/// - `gossipsub::Behaviour` — pub/sub for metadata.
-///
 /// The `#[derive(NetworkBehaviour)]` macro auto-generates
 /// `BitevachatBehaviourEvent` with one variant per field.
 #[derive(NetworkBehaviour)]
@@ -61,81 +73,56 @@ pub struct BitevachatBehaviour {
     pub gossip: gossipsub::Behaviour,
     /// mDNS for automatic LAN peer discovery.
     pub mdns: mdns::tokio::Behaviour,
+    /// Relay client -- connect through relay nodes when behind NAT.
+    pub relay_client: relay::client::Behaviour,
+    /// Relay server (VPS only). Wrapped in Toggle so it can be disabled.
+    pub relay_server: Toggle<relay::Behaviour>,
+    /// AutoNAT -- probes peers to detect NAT status.
+    pub autonat: autonat::Behaviour,
+    /// DCUtR -- upgrades relay circuits to direct connections.
+    pub dcutr: dcutr::Behaviour,
 }
 
 // ---------------------------------------------------------------------------
 // BitevachatSwarm
 // ---------------------------------------------------------------------------
 
-/// High-level wrapper around `Swarm<BitevachatBehaviour>`.
-///
-/// Provides a safe async API for the full Bitevachat network layer:
-/// message routing with ACK, gossip pub/sub, and DHT discovery.
-///
-/// # Usage
-///
-/// ```ignore
-/// let (mut swarm, event_rx) = BitevachatSwarm::new(config, &wallet_kp).await?;
-/// swarm.start_listening("/ip4/0.0.0.0/tcp/0".parse()?)?;
-/// swarm.run().await;
-/// ```
 pub struct BitevachatSwarm {
-    /// The underlying libp2p swarm.
     swarm: Swarm<BitevachatBehaviour>,
-    /// Inbound message handler (validation pipeline).
     handler: MessageHandler,
-    /// Outbound delivery tracker (pending → ACK).
     router: Router,
-    /// Sender-side event channel (receiver given to caller).
     event_sender: mpsc::UnboundedSender<NetworkEvent>,
-    /// Mapping from Bitevachat Address bytes → libp2p PeerId.
-    ///
-    /// Populated from:
-    /// 1. Identify protocol (extract Ed25519 pubkey → compute address).
-    /// 2. Received messages (envelope sender → source peer).
-    /// 3. mDNS discovery + DHT lookups.
     address_book: HashMap<[u8; 32], PeerId>,
-    /// Our own Ed25519 public key (32 bytes) for WireMessage construction.
     local_sender_pubkey: [u8; 32],
+    /// Known relay nodes (PeerId + base Multiaddr without /p2p).
+    relay_nodes: Vec<(PeerId, Multiaddr)>,
+    /// NAT status manager.
+    nat_manager: NatManager,
+    /// Whether relay reservations are active.
+    relay_reservations_active: bool,
 }
 
 impl BitevachatSwarm {
-    /// Creates a new swarm with messaging, gossip, and discovery.
-    ///
-    /// Returns `(swarm, event_receiver)` where `event_receiver` is
-    /// the async channel that delivers all [`NetworkEvent`]s to the
-    /// caller.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BitevachatError::NetworkError` if transport, behaviour,
-    /// or identity construction fails.
     pub async fn new(
         config: NetworkConfig,
         wallet_keypair: &Keypair,
     ) -> BResult<(Self, mpsc::UnboundedReceiver<NetworkEvent>)> {
         config.validate()?;
 
-        // Convert wallet identity → libp2p identity.
         let libp2p_keypair = wallet_keypair_to_libp2p(wallet_keypair)?;
-
-        // Channels for network events.
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-
-        // Shared nonce cache for replay detection.
         let nonce_cache = Arc::new(Mutex::new(NonceCache::new(10_000)));
 
-        // Build handler.
         let handler = MessageHandler::new(
             Arc::clone(&nonce_cache),
             DEFAULT_MAX_TIMESTAMP_SKEW_SECS,
             event_tx.clone(),
         );
-
-        // Build router.
         let router = Router::new();
 
-        // Build swarm via SwarmBuilder.
+        // CRITICAL: `.with_relay_client()` MUST be called so the
+        // transport layer can create relay circuits.  Without it,
+        // `/p2p-circuit` multiaddrs cannot be dialed or listened on.
         let config_clone = config.clone();
         let signing_keypair = libp2p_keypair.clone();
 
@@ -150,8 +137,12 @@ impl BitevachatSwarm {
                 reason: format!("failed to configure TCP transport: {e}"),
             })?
             .with_quic()
-            .with_behaviour(|key| {
-                build_combined_behaviour(key, &config_clone, &signing_keypair)
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|e| BitevachatError::NetworkError {
+                reason: format!("failed to configure relay client transport: {e}"),
+            })?
+            .with_behaviour(|key, relay_client| {
+                build_combined_behaviour(key, &config_clone, &signing_keypair, relay_client)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             })
             .map_err(|e| BitevachatError::NetworkError {
@@ -171,12 +162,14 @@ impl BitevachatSwarm {
             event_sender: event_tx,
             address_book: HashMap::new(),
             local_sender_pubkey: *wallet_keypair.public_key().as_bytes(),
+            relay_nodes: Vec::new(),
+            nat_manager: NatManager::new(),
+            relay_reservations_active: false,
         };
 
         Ok((me, event_rx))
     }
 
-    /// Returns the local `PeerId` of this swarm.
     pub fn local_peer_id(&self) -> &PeerId {
         self.swarm.local_peer_id()
     }
@@ -185,12 +178,6 @@ impl BitevachatSwarm {
     // Listening
     // -----------------------------------------------------------------------
 
-    /// Starts listening on the given multiaddr.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BitevachatError::NetworkError` if the address cannot
-    /// be bound (e.g. port already in use).
     pub fn start_listening(&mut self, addr: Multiaddr) -> BResult<()> {
         self.swarm
             .listen_on(addr)
@@ -200,47 +187,148 @@ impl BitevachatSwarm {
         Ok(())
     }
 
-    /// Returns the list of addresses this swarm is currently listening on.
     pub fn listeners(&self) -> Vec<Multiaddr> {
         self.swarm.listeners().cloned().collect()
     }
 
-    /// Returns the set of currently connected peer IDs.
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.swarm.connected_peers().cloned().collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Relay operations
+    // -----------------------------------------------------------------------
+
+    /// Registers relay nodes from bootstrap multiaddrs.
+    pub fn register_relay_nodes(&mut self, nodes: &[Multiaddr]) {
+        for addr in nodes {
+            if let Some((peer_id, clean_addr)) = extract_peer_id_and_addr(addr) {
+                if !self.relay_nodes.iter().any(|(p, _)| p == &peer_id) {
+                    self.relay_nodes.push((peer_id, clean_addr.clone()));
+                    tracing::info!(
+                        %peer_id,
+                        addr = %clean_addr,
+                        "registered relay node"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Listens on `/p2p-circuit` through all known relay nodes.
+    /// Makes the local node reachable via relay by other NAT peers.
+    pub fn listen_on_relays(&mut self) -> BResult<()> {
+        if self.relay_nodes.is_empty() {
+            tracing::debug!("no relay nodes registered, skipping relay listen");
+            return Ok(());
+        }
+
+        let nodes = self.relay_nodes.clone();
+        for (peer_id, addr) in &nodes {
+            let circuit_listen =
+                relay_helpers::build_relay_listen_addr(addr, peer_id)?;
+
+            match self.swarm.listen_on(circuit_listen.clone()) {
+                Ok(listener_id) => {
+                    tracing::info!(
+                        %peer_id,
+                        addr = %circuit_listen,
+                        ?listener_id,
+                        "listening on relay circuit"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %peer_id,
+                        %e,
+                        "failed to listen on relay circuit (will retry)"
+                    );
+                }
+            }
+        }
+
+        self.relay_reservations_active = true;
+        Ok(())
+    }
+
+    pub fn relay_active(&self) -> bool {
+        self.relay_reservations_active
+    }
+
+    pub fn relay_nodes(&self) -> &[(PeerId, Multiaddr)] {
+        &self.relay_nodes
+    }
+
+    /// Attempts to dial a peer through known relay nodes.
+    pub fn dial_via_relay(&mut self, target_peer_id: &PeerId) -> BResult<bool> {
+        if self.relay_nodes.is_empty() {
+            return Ok(false);
+        }
+
+        let nodes = self.relay_nodes.clone();
+        for (relay_pid, relay_addr) in &nodes {
+            if relay_pid == target_peer_id {
+                continue;
+            }
+            if !self.swarm.is_connected(relay_pid) {
+                continue;
+            }
+
+            match relay_helpers::build_relay_circuit_addr(
+                relay_addr,
+                relay_pid,
+                target_peer_id,
+            ) {
+                Ok(circuit_addr) => {
+                    tracing::info!(
+                        %target_peer_id,
+                        relay = %relay_pid,
+                        addr = %circuit_addr,
+                        "dialing peer via relay circuit"
+                    );
+                    match self.swarm.dial(circuit_addr) {
+                        Ok(()) => return Ok(true),
+                        Err(e) => {
+                            tracing::debug!(
+                                %target_peer_id,
+                                relay = %relay_pid,
+                                %e,
+                                "relay dial failed, trying next relay"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "failed to build relay circuit addr");
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     // -----------------------------------------------------------------------
     // Address book
     // -----------------------------------------------------------------------
 
-    /// Records a Bitevachat Address → PeerId mapping.
-    ///
-    /// Called when we learn a peer's identity from the Identify
-    /// protocol, from an incoming message, or from a DHT lookup.
     pub fn register_peer_address(&mut self, address: &Address, peer_id: PeerId) {
         self.address_book.insert(*address.as_bytes(), peer_id);
     }
 
-    /// Resolves a Bitevachat Address to a libp2p PeerId, if known.
     pub fn resolve_address(&self, address: &Address) -> Option<PeerId> {
         self.address_book.get(address.as_bytes()).copied()
     }
 
-    /// Returns our own Ed25519 public key (32 bytes).
     pub fn sender_pubkey(&self) -> &[u8; 32] {
         &self.local_sender_pubkey
     }
 
-    /// Attempts to deliver a message to a recipient by Bitevachat Address.
+    /// Attempts to deliver a message to a recipient by Address.
     ///
-    /// Looks up the PeerId in the local address book, checks that we
-    /// are connected, and dispatches via `request_response`.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(())` — message queued for delivery (ACK comes later).
-    /// - `Err(...)` — recipient unknown or not connected; retry later.
+    /// 1. Resolve Address -> PeerId.
+    /// 2. If directly connected -> send immediately.
+    /// 3. If not connected -> try dialing via relay circuit.
+    /// 4. Return error (message stays in pending queue for retry).
     pub fn try_deliver_to_address(
         &mut self,
         recipient: &Address,
@@ -256,34 +344,50 @@ impl BitevachatSwarm {
             }
         })?;
 
-        // Check if we're actually connected to this peer.
-        if !self.swarm.is_connected(&peer_id) {
-            return Err(BitevachatError::NetworkError {
-                reason: format!(
-                    "peer {} is known but not connected",
-                    peer_id,
-                ),
-            });
+        // FAST PATH: peer is directly connected -> send now.
+        if self.swarm.is_connected(&peer_id) {
+            let sender_pubkey = self.local_sender_pubkey;
+            self.send_message_to_peer(peer_id, envelope, sender_pubkey, message_id)?;
+            tracing::info!(
+                %message_id, %recipient, %peer_id,
+                "message dispatched to connected peer"
+            );
+            return Ok(());
         }
 
-        let sender_pubkey = self.local_sender_pubkey;
-        self.send_message_to_peer(peer_id, envelope, sender_pubkey, message_id)?;
+        // RELAY FALLBACK: peer known but not connected.
+        // Initiate relay dial; message stays in pending queue and
+        // will be retried once the relayed connection is up.
+        match self.dial_via_relay(&peer_id) {
+            Ok(true) => {
+                tracing::info!(
+                    %message_id, %recipient, %peer_id,
+                    "initiated relay dial -- message will retry from pending queue"
+                );
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    %message_id, %peer_id,
+                    "no relay nodes available for fallback"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(%message_id, %e, "relay dial attempt failed");
+            }
+        }
 
-        tracing::info!(
-            %message_id,
-            %recipient,
-            %peer_id,
-            "message dispatched to connected peer"
-        );
-
-        Ok(())
+        Err(BitevachatError::NetworkError {
+            reason: format!(
+                "peer {} is known but not connected; relay dial initiated",
+                peer_id,
+            ),
+        })
     }
 
     // -----------------------------------------------------------------------
     // Dialing
     // -----------------------------------------------------------------------
 
-    /// Dials a remote peer at the given multiaddr.
     pub fn dial_peer(&mut self, addr: Multiaddr) -> BResult<()> {
         self.swarm
             .dial(addr)
@@ -296,7 +400,6 @@ impl BitevachatSwarm {
     // Discovery (DHT)
     // -----------------------------------------------------------------------
 
-    /// Publishes this node's address → PeerId mapping in the DHT.
     pub fn publish_address(
         &mut self,
         address: &Address,
@@ -308,12 +411,10 @@ impl BitevachatSwarm {
             .publish_address(address, peer_id)
     }
 
-    /// Starts a DHT lookup for the PeerId associated with an address.
     pub fn find_peer(&mut self, address: &Address) -> kad::QueryId {
         self.swarm.behaviour_mut().discovery.find_peer(address)
     }
 
-    /// Adds bootstrap nodes and initiates Kademlia bootstrap.
     pub fn bootstrap(&mut self, nodes: &[Multiaddr]) -> BResult<()> {
         self.swarm
             .behaviour_mut()
@@ -330,7 +431,6 @@ impl BitevachatSwarm {
         Ok(())
     }
 
-    /// Sets the Kademlia mode (Client or Server).
     pub fn set_kademlia_mode(&mut self, mode: kad::Mode) {
         self.swarm.behaviour_mut().discovery.set_mode(mode);
     }
@@ -339,24 +439,6 @@ impl BitevachatSwarm {
     // Direct messaging
     // -----------------------------------------------------------------------
 
-    /// Sends a message to a connected peer via `request_response`.
-    ///
-    /// The message is wrapped in a [`WireMessage`] with the sender's
-    /// public key and tracked by the [`Router`]. The result (ACK or
-    /// failure) is delivered asynchronously as a [`NetworkEvent`].
-    ///
-    /// # Parameters
-    ///
-    /// - `peer_id` — target peer's libp2p PeerId.
-    /// - `envelope` — signed message envelope.
-    /// - `sender_pubkey` — sender's Ed25519 public key (32 bytes).
-    /// - `message_id` — message identifier for tracking.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on successful queueing. The actual delivery result
-    /// arrives later as a `NetworkEvent::DeliveryAck` or
-    /// `NetworkEvent::DeliveryFailed`.
     pub fn send_message_to_peer(
         &mut self,
         peer_id: PeerId,
@@ -374,7 +456,6 @@ impl BitevachatSwarm {
             .send_request(&peer_id, wire);
 
         self.router.track_send(request_id, message_id, recipient, envelope);
-
         Ok(())
     }
 
@@ -382,7 +463,6 @@ impl BitevachatSwarm {
     // Gossip
     // -----------------------------------------------------------------------
 
-    /// Publishes metadata to a gossipsub topic.
     pub fn publish_gossip(
         &mut self,
         topic_name: &str,
@@ -395,20 +475,21 @@ impl BitevachatSwarm {
     // Event loop
     // -----------------------------------------------------------------------
 
-    /// Processes a single swarm event.
-    ///
-    /// Designed for use inside `tokio::select!` where the caller needs
-    /// to multiplex swarm events with other async sources (commands,
-    /// timers, shutdown signals). Each call drives the libp2p swarm
-    /// forward by one event.
     pub async fn poll_next(&mut self) {
         match self.swarm.select_next_some().await {
-            // --- Connection events ------------------------------------
             SwarmEvent::NewListenAddr {
                 listener_id,
                 address,
             } => {
-                tracing::info!(%address, ?listener_id, "new listen address");
+                let addr_str = address.to_string();
+                if addr_str.contains("p2p-circuit") {
+                    tracing::info!(
+                        %address, ?listener_id,
+                        "*** relay circuit listener active -- node reachable via relay ***"
+                    );
+                } else {
+                    tracing::info!(%address, ?listener_id, "new listen address");
+                }
             }
 
             SwarmEvent::ConnectionEstablished {
@@ -417,12 +498,18 @@ impl BitevachatSwarm {
                 num_established,
                 ..
             } => {
-                tracing::info!(
-                    %peer_id,
-                    ?endpoint,
-                    num_established,
-                    "connection established"
-                );
+                let addr_str = endpoint.get_remote_address().to_string();
+                if addr_str.contains("p2p-circuit") {
+                    tracing::info!(
+                        %peer_id, remote_addr = %addr_str,
+                        "*** RELAYED connection established ***"
+                    );
+                } else {
+                    tracing::info!(
+                        %peer_id, ?endpoint, num_established,
+                        "connection established"
+                    );
+                }
                 let _ = self
                     .event_sender
                     .send(NetworkEvent::PeerConnected(peer_id));
@@ -453,99 +540,28 @@ impl BitevachatSwarm {
                 ..
             } => {
                 tracing::warn!(
-                    %local_addr,
-                    %send_back_addr,
-                    %error,
+                    %local_addr, %send_back_addr, %error,
                     "incoming connection error"
                 );
             }
 
-            // --- Behaviour events -------------------------------------
+            SwarmEvent::ExternalAddrConfirmed { address } => {
+                tracing::info!(%address, "external address confirmed");
+            }
+
             SwarmEvent::Behaviour(event) => {
                 self.handle_behaviour_event(event).await;
             }
 
-            // --- Catch-all --------------------------------------------
             other => {
                 tracing::trace!(?other, "unhandled swarm event");
             }
         }
     }
 
-    /// Runs the swarm event loop, processing all network events.
-    ///
-    /// This method runs indefinitely. Use `tokio::select!` or task
-    /// cancellation to stop it.
     pub async fn run(&mut self) {
         loop {
-            match self.swarm.select_next_some().await {
-                // --- Connection events ------------------------------------
-                SwarmEvent::NewListenAddr {
-                    listener_id,
-                    address,
-                } => {
-                    tracing::info!(%address, ?listener_id, "new listen address");
-                }
-
-                SwarmEvent::ConnectionEstablished {
-                    peer_id,
-                    endpoint,
-                    num_established,
-                    ..
-                } => {
-                    tracing::info!(
-                        %peer_id,
-                        ?endpoint,
-                        num_established,
-                        "connection established"
-                    );
-                    let _ = self
-                        .event_sender
-                        .send(NetworkEvent::PeerConnected(peer_id));
-                }
-
-                SwarmEvent::ConnectionClosed {
-                    peer_id,
-                    cause,
-                    num_established,
-                    ..
-                } => {
-                    tracing::info!(%peer_id, ?cause, num_established, "connection closed");
-                    if num_established == 0 {
-                        let _ = self
-                            .event_sender
-                            .send(NetworkEvent::PeerDisconnected(peer_id));
-                    }
-                }
-
-                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                    tracing::warn!(?peer_id, %error, "outgoing connection error");
-                }
-
-                SwarmEvent::IncomingConnectionError {
-                    local_addr,
-                    send_back_addr,
-                    error,
-                    ..
-                } => {
-                    tracing::warn!(
-                        %local_addr,
-                        %send_back_addr,
-                        %error,
-                        "incoming connection error"
-                    );
-                }
-
-                // --- Behaviour events -------------------------------------
-                SwarmEvent::Behaviour(event) => {
-                    self.handle_behaviour_event(event).await;
-                }
-
-                // --- Catch-all --------------------------------------------
-                other => {
-                    tracing::trace!(?other, "unhandled swarm event");
-                }
-            }
+            self.poll_next().await;
         }
     }
 
@@ -567,27 +583,66 @@ impl BitevachatSwarm {
             BitevachatBehaviourEvent::Mdns(mdns_event) => {
                 self.handle_mdns_event(mdns_event);
             }
+            BitevachatBehaviourEvent::RelayClient(event) => {
+                self.handle_relay_client_event(event);
+            }
+            BitevachatBehaviourEvent::RelayServer(event) => {
+                relay_helpers::log_relay_server_event(&event);
+            }
+            BitevachatBehaviourEvent::Autonat(event) => {
+                if let Some(new_status) = self.nat_manager.on_autonat_event(event) {
+                    let _ = self.event_sender.send(
+                        NetworkEvent::NatStatusChanged(new_status),
+                    );
+                }
+            }
+            BitevachatBehaviourEvent::Dcutr(event) => {
+                self.handle_dcutr_event(event);
+            }
         }
     }
 
-    /// Handles mDNS events for automatic LAN peer discovery.
-    ///
-    /// When a new peer is discovered via mDNS, we add its addresses
-    /// to the Kademlia routing table so DHT lookups can find it.
+    fn handle_relay_client_event(&mut self, event: relay::client::Event) {
+        relay_helpers::log_relay_client_event(&event);
+
+        match event {
+            relay::client::Event::ReservationReqAccepted {
+                relay_peer_id, renewal, ..
+            } => {
+                self.relay_reservations_active = true;
+                tracing::info!(
+                    %relay_peer_id, renewal,
+                    "relay reservation ACTIVE -- node reachable via this relay"
+                );
+            }
+            relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => {
+                tracing::info!(
+                    %src_peer_id,
+                    "inbound relay circuit from peer"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_dcutr_event(&mut self, event: dcutr::Event) {
+        // Log all DCUtR events. The exact variant names differ across
+        // libp2p versions, so we use Debug formatting for portability.
+        tracing::info!(?event, "DCUtR event");
+    }
+
     fn handle_mdns_event(&mut self, event: mdns::Event) {
         match event {
             mdns::Event::Discovered(peers) => {
                 for (peer_id, addr) in peers {
                     tracing::info!(%peer_id, %addr, "mDNS: discovered peer");
-                    // Add to Kademlia so DHT queries can resolve this peer.
                     self.swarm
                         .behaviour_mut()
                         .discovery
                         .kademlia
                         .add_address(&peer_id, addr.clone());
-                    // Also dial directly to establish a connection.
                     if let Err(e) = self.swarm.dial(addr) {
-                        tracing::debug!(%peer_id, %e, "mDNS: dial failed (may already be connected)");
+                        tracing::debug!(%peer_id, %e, "mDNS: dial failed");
                     }
                 }
             }
@@ -599,13 +654,11 @@ impl BitevachatSwarm {
         }
     }
 
-    /// Handles request_response events for direct messaging.
     async fn handle_messaging_event(
         &mut self,
         event: request_response::Event<WireMessage, Ack>,
     ) {
         match event {
-            // --- Inbound request: validate and respond with ACK ---
             request_response::Event::Message {
                 peer,
                 message:
@@ -614,8 +667,6 @@ impl BitevachatSwarm {
                     },
             } => {
                 let wire: WireMessage = request;
-
-                // Learn sender's Address → PeerId mapping.
                 let sender_bytes = *wire.envelope.message.sender.as_bytes();
                 self.address_book.insert(sender_bytes, peer);
 
@@ -624,7 +675,6 @@ impl BitevachatSwarm {
                     .on_message_received(peer, wire.envelope, &wire.sender_pubkey)
                     .await;
 
-                // Send the ACK back through the response channel.
                 if self
                     .swarm
                     .behaviour_mut()
@@ -636,7 +686,6 @@ impl BitevachatSwarm {
                 }
             }
 
-            // --- Outbound response: ACK received from remote ---
             request_response::Event::Message {
                 peer,
                 message:
@@ -656,24 +705,20 @@ impl BitevachatSwarm {
                                 .send(NetworkEvent::DeliveryAck(msg_id));
                         }
                         DeliveryStatus::Failed => {
-                            tracing::warn!(?msg_id, %peer, ?response, "message rejected by peer");
+                            tracing::warn!(?msg_id, %peer, ?response, "message rejected");
                             let _ = self
                                 .event_sender
                                 .send(NetworkEvent::DeliveryFailed(msg_id));
                         }
                         DeliveryStatus::Queued => {
-                            // Should not occur for an ACK, but handle gracefully.
                             tracing::debug!(?msg_id, "unexpected Queued status on ACK");
                         }
                     }
                 }
             }
 
-            // --- Outbound failure: send failed ---
             request_response::Event::OutboundFailure {
-                peer,
-                request_id,
-                error,
+                peer, request_id, error,
             } => {
                 tracing::warn!(%peer, ?error, "outbound message delivery failed");
                 if let Some(pending) = self.router.on_send_failed(&request_id) {
@@ -683,29 +728,22 @@ impl BitevachatSwarm {
                 }
             }
 
-            // --- Inbound failure: handler error ---
             request_response::Event::InboundFailure {
-                peer,
-                error,
-                ..
+                peer, error, ..
             } => {
                 tracing::warn!(%peer, ?error, "inbound message handling failed");
             }
 
-            // --- Response sent confirmation ---
             request_response::Event::ResponseSent { peer, .. } => {
                 tracing::trace!(%peer, "ACK response sent");
             }
         }
     }
 
-    /// Handles gossipsub events.
     fn handle_gossip_event(&self, event: gossipsub::Event) {
         match event {
             gossipsub::Event::Message {
-                propagation_source,
-                message,
-                ..
+                propagation_source, message, ..
             } => {
                 let _ = self.event_sender.send(NetworkEvent::GossipMessage {
                     source: propagation_source,
@@ -727,7 +765,7 @@ impl BitevachatSwarm {
 }
 
 // ---------------------------------------------------------------------------
-// Discovery event handlers (logging)
+// Discovery event handlers
 // ---------------------------------------------------------------------------
 
 fn handle_discovery_event(
@@ -775,8 +813,7 @@ fn handle_kademlia_event(event: kad::Event) {
                 tracing::warn!(?id, ?e, "DHT put_record failed");
             }
             kad::QueryResult::Bootstrap(Ok(kad::BootstrapOk {
-                peer,
-                num_remaining,
+                peer, num_remaining,
             })) => {
                 tracing::info!(?id, %peer, num_remaining, "Kademlia bootstrap progress");
             }
@@ -822,21 +859,16 @@ fn handle_identify_event(
                 "identify: received peer info"
             );
 
-            // If the peer's public key is Ed25519, compute their
-            // Bitevachat address and add to the address book.
             if let Ok(ed_pk) = info.public_key.try_into_ed25519() {
                 let raw_bytes = ed_pk.to_bytes();
                 let bpk = PublicKey::from_bytes(raw_bytes);
                 let address = pubkey_to_address(&bpk);
                 address_book.insert(*address.as_bytes(), peer_id);
                 tracing::info!(
-                    %peer_id,
-                    %address,
+                    %peer_id, %address,
                     "identify: mapped peer address in address book"
                 );
 
-                // Notify higher layers so they can flush pending
-                // messages for this newly-reachable address.
                 let _ = event_sender.send(NetworkEvent::PeerAddressResolved {
                     address,
                     peer_id,
@@ -860,20 +892,39 @@ fn handle_identify_event(
 }
 
 // ---------------------------------------------------------------------------
+// Helper
+// ---------------------------------------------------------------------------
+
+fn extract_peer_id_and_addr(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
+    let mut clean_addr = Multiaddr::empty();
+    let mut peer_id = None;
+
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::P2p(id) => {
+                peer_id = Some(id);
+            }
+            other => {
+                clean_addr.push(other);
+            }
+        }
+    }
+
+    peer_id.map(|pid| (pid, clean_addr))
+}
+
+// ---------------------------------------------------------------------------
 // Behaviour construction
 // ---------------------------------------------------------------------------
 
-/// Builds the combined [`BitevachatBehaviour`].
 fn build_combined_behaviour(
     key: &libp2p::identity::Keypair,
     config: &NetworkConfig,
     signing_keypair: &libp2p::identity::Keypair,
+    relay_client: relay::client::Behaviour,
 ) -> BResult<BitevachatBehaviour> {
     let discovery = build_discovery_behaviour(key, config)?;
 
-    // Use the built-in CBOR codec from libp2p-request-response.
-    // Behaviour::new creates a default cbor::Codec internally;
-    // WireMessage/Ack implement Serialize + Deserialize via serde.
     let messaging = libp2p_request_response::cbor::Behaviour::<WireMessage, Ack>::new(
         [(MSG_PROTOCOL, ProtocolSupport::Full)],
         request_response::Config::default(),
@@ -882,8 +933,8 @@ fn build_combined_behaviour(
     let mut gossip_beh = gossip::build_gossip_behaviour(signing_keypair)?;
     subscribe_default_topics(&mut gossip_beh)?;
 
-    // mDNS for automatic LAN peer discovery.
     let local_peer_id = PeerId::from(key.public());
+
     let mdns_config = mdns::Config {
         ttl: Duration::from_secs(300),
         query_interval: Duration::from_secs(30),
@@ -894,10 +945,30 @@ fn build_combined_behaviour(
             reason: format!("failed to create mDNS behaviour: {e}"),
         })?;
 
+    // Relay server: only enabled on VPS nodes.
+    let relay_server = if config.enable_relay_server {
+        tracing::info!("relay SERVER enabled -- this node will relay for others");
+        Toggle::from(Some(relay::Behaviour::new(
+            local_peer_id,
+            relay::Config::default(),
+        )))
+    } else {
+        tracing::debug!("relay server disabled (client only)");
+        Toggle::from(None)
+    };
+
+    let autonat_config = crate::nat::build_autonat_config(3);
+    let autonat_beh = autonat::Behaviour::new(local_peer_id, autonat_config);
+    let dcutr_beh = dcutr::Behaviour::new(local_peer_id);
+
     Ok(BitevachatBehaviour {
         discovery,
         messaging,
         gossip: gossip_beh,
         mdns: mdns_beh,
+        relay_client,
+        relay_server,
+        autonat: autonat_beh,
+        dcutr: dcutr_beh,
     })
 }

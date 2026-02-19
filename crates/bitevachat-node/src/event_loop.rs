@@ -3,15 +3,12 @@
 //! [`run_event_loop`] is spawned as a tokio task by [`Node::start`].
 //! It uses `tokio::select!` to multiplex:
 //!
-//! 1. **Network swarm** — `poll_next()` drives libp2p event processing.
-//! 2. **Network events** — `MessageReceived`, `DeliveryAck`, etc.
-//! 3. **Commands** — `SendMessage`, `GetStatus`, `Shutdown` from RPC.
-//! 4. **Pending tick** — periodic retry of undelivered messages.
-//! 5. **Maintenance tick** — storage flush, DHT refresh.
-//! 6. **Shutdown signal** — graceful exit via `watch` channel.
-//!
-//! All branches are non-blocking. No busy loops. No uncontrolled
-//! task spawning.
+//! 1. **Network swarm** -- `poll_next()` drives libp2p event processing.
+//! 2. **Network events** -- `MessageReceived`, `DeliveryAck`, etc.
+//! 3. **Commands** -- `SendMessage`, `GetStatus`, `Shutdown` from RPC.
+//! 4. **Pending tick** -- periodic retry of undelivered messages.
+//! 5. **Maintenance tick** -- storage flush, DHT refresh, relay re-listen.
+//! 6. **Shutdown signal** -- graceful exit via `watch` channel.
 
 use std::time::Duration;
 
@@ -29,11 +26,6 @@ use crate::outgoing;
 // Helper: PeerId -> NodeId
 // ---------------------------------------------------------------------------
 
-/// Converts a libp2p `PeerId` to a Bitevachat `NodeId`.
-///
-/// `PeerId` is a variable-length multihash; `NodeId` is fixed 32 bytes.
-/// We hash the PeerId bytes with SHA3-256 to produce a consistent
-/// 32-byte identifier.
 fn peer_id_to_node_id(peer_id: &libp2p::PeerId) -> NodeId {
     let bytes = peer_id.to_bytes();
     let hash = bitevachat_crypto::hash::sha3_256(&bytes);
@@ -44,11 +36,6 @@ fn peer_id_to_node_id(peer_id: &libp2p::PeerId) -> NodeId {
 // Event loop entry point
 // ---------------------------------------------------------------------------
 
-/// Runs the node event loop until shutdown is signalled.
-///
-/// This function takes ownership of the [`NodeRuntime`] and runs
-/// until the shutdown watch channel fires. It is designed to be
-/// spawned as a tokio task via `Node::start`.
 pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
     tracing::info!("node event loop started");
 
@@ -65,10 +52,6 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
     }
 
     // Bootstrap: connect to known peers so we can join the DHT.
-    //
-    // Without bootstrap nodes, the only discovery method is mDNS
-    // (LAN only).  With bootstrap nodes, the node can discover
-    // peers across the internet via the Kademlia DHT.
     if !rt.bootstrap_nodes.is_empty() {
         tracing::info!(
             count = rt.bootstrap_nodes.len(),
@@ -78,14 +61,15 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
             Ok(()) => tracing::info!("Kademlia bootstrap initiated"),
             Err(e) => tracing::warn!(%e, "bootstrap failed (will retry in maintenance tick)"),
         }
+
+        // Register bootstrap nodes as relay nodes so we can dial
+        // through them and listen on their relay circuits.
+        rt.network.register_relay_nodes(&rt.bootstrap_nodes);
     } else {
-        tracing::info!("no bootstrap nodes configured — using mDNS only (LAN discovery)");
+        tracing::info!("no bootstrap nodes configured -- using mDNS only (LAN discovery)");
     }
 
-    // Publish our Address→PeerId mapping to the DHT so other
-    // nodes can find us.  This may fail if no peers are known yet
-    // (the mDNS or bootstrap process will add them later and we
-    // re-publish in the maintenance tick).
+    // Publish our Address->PeerId mapping to the DHT.
     {
         let my_address = bitevachat_crypto::signing::pubkey_to_address(
             &bitevachat_crypto::signing::PublicKey::from_bytes(*rt.wallet.public_key()),
@@ -97,18 +81,26 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
         }
     }
 
+    // Flag: have we attempted relay listen yet?
+    // We delay relay listen until we actually have a connection to the
+    // relay node (the ConnectionEstablished event fires first, then
+    // Identify runs).  We use a one-shot timer to give the bootstrap
+    // handshake time to complete before attempting relay listen.
+    let relay_listen_delay = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(relay_listen_delay);
+    let mut relay_listen_attempted = false;
+
     loop {
         tokio::select! {
             // ---------------------------------------------------------------
-            // 1. Drive the network swarm (process one libp2p event).
+            // 1. Drive the network swarm.
             // ---------------------------------------------------------------
             _ = rt.network.poll_next() => {
-                // Events are dispatched internally by the swarm and
-                // emitted to network_rx. Nothing else to do here.
+                // Events dispatched internally by swarm -> network_rx.
             }
 
             // ---------------------------------------------------------------
-            // 2. Process network events emitted by the swarm.
+            // 2. Process network events.
             // ---------------------------------------------------------------
             Some(net_event) = rt.network_rx.recv() => {
                 let flush_pending = matches!(
@@ -149,34 +141,61 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
             }
 
             // ---------------------------------------------------------------
-            // 5. Maintenance tick (flush, prune, DHT refresh).
+            // 5. Maintenance tick (flush, prune, DHT refresh, relay).
             // ---------------------------------------------------------------
             _ = maintenance_tick.tick() => {
                 handle_maintenance_tick(&rt.storage, &rt.config);
 
-                // Re-publish our Address→PeerId in the DHT periodically.
+                // Re-publish our Address->PeerId in the DHT.
                 let my_address = bitevachat_crypto::signing::pubkey_to_address(
                     &bitevachat_crypto::signing::PublicKey::from_bytes(*rt.wallet.public_key()),
                 );
                 let my_peer_id = *rt.network.local_peer_id();
                 let _ = rt.network.publish_address(&my_address, &my_peer_id);
 
-                // Periodic Kademlia re-bootstrap to refresh the routing
-                // table and discover new peers.
+                // Periodic Kademlia re-bootstrap.
                 if !rt.bootstrap_nodes.is_empty() {
                     let _ = rt.network.bootstrap(&rt.bootstrap_nodes);
+                }
+
+                // Re-listen on relays if reservations dropped.
+                // This ensures resilience if the relay server restarts
+                // or the reservation expires.
+                if !rt.bootstrap_nodes.is_empty() && !rt.network.relay_active() {
+                    tracing::info!("relay reservations inactive -- re-attempting");
+                    if let Err(e) = rt.network.listen_on_relays() {
+                        tracing::warn!(%e, "relay re-listen failed");
+                    }
                 }
 
                 // Log network health.
                 let peers = rt.network.connected_peers();
                 tracing::info!(
                     connected_peers = peers.len(),
+                    relay_active = rt.network.relay_active(),
                     "maintenance: network health check"
                 );
             }
 
             // ---------------------------------------------------------------
-            // 6. Shutdown signal via watch channel.
+            // 6. Relay listen delay (one-shot, 5s after startup).
+            // ---------------------------------------------------------------
+            _ = &mut relay_listen_delay, if !relay_listen_attempted => {
+                relay_listen_attempted = true;
+                if !rt.bootstrap_nodes.is_empty() {
+                    tracing::info!("attempting relay listen on bootstrap/relay nodes");
+                    match rt.network.listen_on_relays() {
+                        Ok(()) => tracing::info!("relay listen initiated"),
+                        Err(e) => tracing::warn!(
+                            %e,
+                            "relay listen failed (will retry in maintenance tick)"
+                        ),
+                    }
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // 7. Shutdown signal via watch channel.
             // ---------------------------------------------------------------
             _ = rt.shutdown_rx.changed() => {
                 if *rt.shutdown_rx.borrow() {
@@ -187,9 +206,7 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
         }
     }
 
-    // Graceful shutdown sequence.
     shutdown_sequence(&rt.storage, &rt.pending_queue);
-
     tracing::info!("node event loop exited");
 }
 
@@ -197,7 +214,6 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
 // Network event handler
 // ---------------------------------------------------------------------------
 
-/// Dispatches a network event to the appropriate handler.
 async fn handle_network_event(
     event: NetworkEvent,
     spam_filter: &crate::spam_filter::SpamFilter,
@@ -210,7 +226,7 @@ async fn handle_network_event(
         NetworkEvent::MessageReceived(envelope) => {
             let result = incoming::handle_incoming_message(
                 &envelope,
-                None, // PoW: transport metadata, not yet wired
+                None,
                 spam_filter,
                 storage,
                 event_tx,
@@ -222,9 +238,7 @@ async fn handle_network_event(
         }
 
         NetworkEvent::DeliveryAck(msg_id) => {
-            // Mark delivered in pending queue (ignore if not present).
             let _ = pending_queue.mark_delivered(&msg_id);
-
             let _ = event_tx
                 .send(NodeEvent::DeliveryAcknowledged {
                     message_id: msg_id,
@@ -233,10 +247,8 @@ async fn handle_network_event(
         }
 
         NetworkEvent::DeliveryFailed(msg_id) => {
-            // Increment retry count in pending queue.
             let now = Timestamp::now();
             let _ = pending_queue.mark_failed(&msg_id, &now);
-
             tracing::debug!(%msg_id, "message delivery failed, pending queue updated");
         }
 
@@ -250,16 +262,14 @@ async fn handle_network_event(
 
         NetworkEvent::PeerAddressResolved { address, peer_id } => {
             tracing::info!(
-                %address,
-                %peer_id,
-                "peer address resolved — will flush pending messages"
+                %address, %peer_id,
+                "peer address resolved -- will flush pending messages"
             );
 
             match pending_queue.reset_backoff_for_recipient(&address) {
                 Ok(n) if n > 0 => {
                     tracing::info!(
-                        %address,
-                        count = n,
+                        %address, count = n,
                         "reset backoff for pending messages"
                     );
                 }
@@ -309,22 +319,15 @@ async fn handle_gossip_message(
     event_tx: &tokio::sync::mpsc::Sender<NodeEvent>,
 ) {
     tracing::debug!(
-        %source,
-        topic,
-        bytes = data.len(),
+        %source, topic, bytes = data.len(),
         "gossip message received"
     );
 
     if topic == TOPIC_PROFILE_UPDATES {
         handle_gossip_profile_update(data, profile_manager, storage, event_tx).await;
     }
-    // Other topics (e.g. "presence") can be added here.
 }
 
-/// Processes a profile update received via gossip.
-///
-/// All errors are logged and swallowed — a malformed gossip message
-/// must never crash the event loop.
 async fn handle_gossip_profile_update(
     data: &[u8],
     profile_manager: &crate::profile_manager::ProfileManager,
@@ -342,12 +345,9 @@ async fn handle_gossip_profile_update(
     tracing::debug!(
         address = %signed.profile.address,
         version = signed.profile.version,
-        "received profile update via gossip (pubkey lookup pending)"
+        "received profile update via gossip"
     );
 
-    // Emit event to notify consumers that a profile arrived.
-    // Full verification will be added when PeerId->PublicKey
-    // mapping is wired from the identify protocol.
     let _ = event_tx
         .send(NodeEvent::ProfileUpdated {
             address: signed.profile.address,
@@ -359,15 +359,6 @@ async fn handle_gossip_profile_update(
 // Command handler
 // ---------------------------------------------------------------------------
 
-/// Processes a single node command.
-///
-/// Returns `true` if the event loop should exit (shutdown command).
-///
-/// This function is intentionally **not** async. All operations
-/// are synchronous (build envelope, enqueue pending, build status).
-/// Keeping it sync avoids holding `&mut NodeRuntime` across await
-/// points, which would require `NodeRuntime: Sync` (violated by
-/// libp2p's `Swarm` internals).
 fn handle_command(
     cmd: NodeCommand,
     rt: &mut NodeRuntime,
@@ -460,10 +451,7 @@ fn handle_command(
                 avatar_bytes.as_deref(),
                 &rt.storage,
             );
-            // Map Result<Vec<u8>> to Result<(String, u64)>:
-            // On success we return (avatar_cid_hex, new_version).
             let mapped = result.map(|_cbor_bytes| {
-                // Re-read the just-updated profile to get cid + version.
                 let address = bitevachat_crypto::signing::pubkey_to_address(
                     &bitevachat_crypto::signing::PublicKey::from_bytes(
                         *rt.wallet.public_key(),
@@ -502,6 +490,8 @@ fn handle_command(
 
         NodeCommand::AddBootstrapNode { addr, reply } => {
             tracing::info!(%addr, "adding bootstrap node");
+            // Also register as relay node.
+            rt.network.register_relay_nodes(&[addr.clone()]);
             let result = rt.network.bootstrap(&[addr]);
             let _ = reply.send(result);
             false
@@ -511,7 +501,7 @@ fn handle_command(
     }
 }
 
-/// Handles the SendMessage command: build envelope → store locally → enqueue pending.
+/// Handles the SendMessage command.
 fn handle_send_message(
     rt: &mut NodeRuntime,
     recipient: bitevachat_types::Address,
@@ -528,7 +518,7 @@ fn handle_send_message(
         rt.node_id,
     )?;
 
-    // --- 1. Store outgoing message in the local message database --------
+    // 1. Store outgoing message locally.
     let sender_addr = bitevachat_crypto::signing::pubkey_to_address(
         &bitevachat_crypto::signing::PublicKey::from_bytes(*rt.wallet.public_key()),
     );
@@ -547,7 +537,6 @@ fn handle_send_message(
         convo_id: *convo_id.as_bytes(),
         timestamp_millis: envelope.message.timestamp.as_datetime().timestamp_millis(),
         payload_type: type_byte,
-        // Store PLAINTEXT for local display; encryption is for the wire only.
         payload_ciphertext: plaintext.to_vec(),
         nonce: *envelope.message.nonce.as_bytes(),
         signature: envelope.signature.as_bytes().to_vec(),
@@ -555,12 +544,11 @@ fn handle_send_message(
 
     if let Err(e) = rt.storage.messages().and_then(|ms| ms.store_message(&stored)) {
         tracing::warn!(%e, %message_id, "failed to store outgoing message locally");
-        // Continue — delivery is more important than local persistence.
     } else {
         tracing::debug!(%message_id, "outgoing message stored locally");
     }
 
-    // --- 2. Enqueue for pending delivery --------------------------------
+    // 2. Enqueue for pending delivery.
     let pending_entry = bitevachat_storage::pending::PendingEntry {
         envelope: envelope.clone(),
         retry_count: 0,
@@ -574,28 +562,21 @@ fn handle_send_message(
         e
     })?;
 
-    tracing::info!(
-        %message_id,
-        "message stored and enqueued for delivery"
-    );
+    tracing::info!(%message_id, "message stored and enqueued for delivery");
 
-    // --- 3. Attempt direct delivery if peer is known + connected -------
+    // 3. Attempt delivery (direct or via relay fallback).
     match rt.network.try_deliver_to_address(
         &recipient,
         envelope,
         message_id,
     ) {
         Ok(()) => {
-            tracing::info!(%message_id, %recipient, "direct delivery dispatched");
+            tracing::info!(%message_id, %recipient, "delivery dispatched");
         }
         Err(e) => {
-            // Not fatal: message is in the pending queue and will be
-            // retried on the next tick once the peer is discovered.
             tracing::debug!(
-                %message_id,
-                %recipient,
-                %e,
-                "direct delivery not possible, will retry from pending queue"
+                %message_id, %recipient, %e,
+                "delivery not possible now, will retry from pending queue"
             );
         }
     }
@@ -603,7 +584,6 @@ fn handle_send_message(
     Ok(message_id)
 }
 
-/// Builds a status snapshot of the node.
 fn build_status(rt: &NodeRuntime) -> NodeStatus {
     let pending_count = rt
         .pending_queue
@@ -635,12 +615,6 @@ fn build_status(rt: &NodeRuntime) -> NodeStatus {
 // Message query handlers
 // ---------------------------------------------------------------------------
 
-/// Lists messages for a conversation.
-///
-/// The `convo_id` from the GUI is the **peer address** (not the
-/// hashed conversation ID). We recompute the real ConvoId using
-/// `compute_convo_id(my_address, peer_address)` to match what
-/// both `handle_send_message` and `incoming::store_envelope` use.
 fn handle_list_messages(
     rt: &NodeRuntime,
     convo_id: bitevachat_types::ConvoId,
@@ -651,8 +625,6 @@ fn handle_list_messages(
         &bitevachat_crypto::signing::PublicKey::from_bytes(*rt.wallet.public_key()),
     );
 
-    // The GUI sends the peer address bytes wrapped as ConvoId.
-    // Recompute the real SHA3 convo ID from (my_address, peer_address).
     let peer_address = bitevachat_types::Address::new(*convo_id.as_bytes());
     let real_convo_id = incoming::compute_convo_id(&my_address, &peer_address);
 
@@ -665,8 +637,7 @@ fn handle_list_messages(
 
     tracing::debug!(
         count = stored_messages.len(),
-        limit,
-        offset,
+        limit, offset,
         "ListMessages: returning {} messages",
         stored_messages.len(),
     );
@@ -702,8 +673,6 @@ fn handle_get_message(
     _storage: &bitevachat_storage::engine::StorageEngine,
     message_id: MessageId,
 ) -> std::result::Result<Option<MessageInfo>, BitevachatError> {
-    // Single-message lookup is not yet supported by the current
-    // MessageStore API (it uses prefix scans). Log and return None.
     tracing::debug!(%message_id, "GetMessage: single-key lookup not yet implemented");
     Ok(None)
 }
@@ -822,12 +791,7 @@ fn handle_inject_message(
     let msg_store = storage.messages()?;
     msg_store.store_message(&stored)?;
 
-    tracing::info!(
-        %message_id,
-        %sender,
-        "injected message stored"
-    );
-
+    tracing::info!(%message_id, %sender, "injected message stored");
     Ok(message_id)
 }
 
@@ -840,12 +804,10 @@ fn handle_pending_tick(
 ) {
     let now = Timestamp::now();
 
-    // 1. Purge expired entries (7 day TTL).
     if let Err(e) = rt.pending_queue.purge_expired(7, &now) {
         tracing::warn!(%e, "failed to purge expired pending entries");
     }
 
-    // 2. Dequeue entries whose backoff has elapsed.
     let ready = match rt.pending_queue.dequeue_ready(&now) {
         Ok(entries) => entries,
         Err(e) => {
@@ -860,7 +822,6 @@ fn handle_pending_tick(
 
     tracing::debug!(count = ready.len(), "pending tick: retrying messages");
 
-    // 3. Attempt delivery for each ready entry.
     for entry in &ready {
         let msg_id = *entry.message_id();
 
@@ -870,10 +831,6 @@ fn handle_pending_tick(
             msg_id,
         ) {
             Ok(()) => {
-                // Delivery dispatched — the ACK handler
-                // (NetworkEvent::DeliveryAck) will call
-                // pending_queue.mark_delivered() when the
-                // recipient acknowledges receipt.
                 tracing::debug!(
                     %msg_id,
                     recipient = %entry.recipient,
@@ -881,13 +838,10 @@ fn handle_pending_tick(
                 );
             }
             Err(e) => {
-                // Peer not known or not connected — bump retry count
-                // so exponential backoff kicks in.
                 let fail_now = Timestamp::now();
                 let _ = rt.pending_queue.mark_failed(&msg_id, &fail_now);
                 tracing::debug!(
-                    %msg_id,
-                    %e,
+                    %msg_id, %e,
                     retry = entry.retry_count + 1,
                     "pending retry: delivery failed, will backoff"
                 );
@@ -924,14 +878,12 @@ fn handle_maintenance_tick(
 // Shutdown sequence
 // ---------------------------------------------------------------------------
 
-/// Performs graceful shutdown: flush storage, log final state.
 fn shutdown_sequence(
     storage: &bitevachat_storage::engine::StorageEngine,
     pending_queue: &std::sync::Arc<bitevachat_storage::pending::PendingQueue>,
 ) {
     tracing::info!("running shutdown sequence");
 
-    // Flush storage.
     if let Err(e) = storage.flush() {
         tracing::error!(%e, "failed to flush storage during shutdown");
     }
