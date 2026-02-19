@@ -32,9 +32,17 @@ use crate::protocol::Ack;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Default maximum allowed clock skew between sender and recipient
-/// (5 minutes, matching the Bitevachat spec).
+/// Default maximum allowed clock skew for FUTURE timestamps
+/// (message claims to be from the future -- strict: 5 minutes).
 pub const DEFAULT_MAX_TIMESTAMP_SKEW_SECS: u64 = 300;
+
+/// Maximum allowed age for PAST timestamps.
+///
+/// Messages relayed through circuit relays or retried from the
+/// pending queue can arrive significantly later than their creation
+/// time.  We allow up to 30 minutes of past drift to accommodate
+/// relay setup, pending retries, and modest clock differences.
+pub const MAX_PAST_TIMESTAMP_SKEW_SECS: u64 = 1800;
 
 // ---------------------------------------------------------------------------
 // HandlerResult
@@ -138,22 +146,48 @@ impl MessageHandler {
             };
         }
 
-        // Step 3: Validate timestamp skew.
+        // Step 3: Validate timestamp skew (asymmetric).
+        //
+        // Messages can arrive late due to relay circuits, pending
+        // queue retries, and network delays.  We use asymmetric
+        // skew limits:
+        //   - PAST:   message older than now → generous (30 min)
+        //   - FUTURE: message ahead of now   → strict   (5 min)
+        //
+        // This prevents replay of ancient messages while tolerating
+        // legitimate delivery delays through relay nodes.
         let now = Timestamp::now();
         let now_millis = now.as_datetime().timestamp_millis();
         let msg_millis = envelope.message.timestamp.as_datetime().timestamp_millis();
-        let skew_millis = (self.max_timestamp_skew_secs as i64).saturating_mul(1000);
+        let diff = now_millis - msg_millis; // positive = message is in the past
 
-        let diff = (now_millis - msg_millis).abs();
-        if diff > skew_millis {
-            tracing::warn!(
-                diff_ms = diff,
-                max_ms = skew_millis,
-                "timestamp outside allowed skew window"
-            );
-            return HandlerResult {
-                ack: Ack::InvalidTimestamp,
-            };
+        if diff > 0 {
+            // Message is from the past (normal case for relayed msgs).
+            let max_past_ms = (MAX_PAST_TIMESTAMP_SKEW_SECS as i64).saturating_mul(1000);
+            if diff > max_past_ms {
+                tracing::warn!(
+                    diff_ms = diff,
+                    max_past_ms,
+                    "message too old (past timestamp beyond limit)"
+                );
+                return HandlerResult {
+                    ack: Ack::InvalidTimestamp,
+                };
+            }
+        } else {
+            // Message is from the future (clock ahead).
+            let future_diff = diff.abs();
+            let max_future_ms = (self.max_timestamp_skew_secs as i64).saturating_mul(1000);
+            if future_diff > max_future_ms {
+                tracing::warn!(
+                    diff_ms = future_diff,
+                    max_future_ms,
+                    "message from the future (timestamp ahead of local clock)"
+                );
+                return HandlerResult {
+                    ack: Ack::InvalidTimestamp,
+                };
+            }
         }
 
         // Step 4: Nonce replay check.
