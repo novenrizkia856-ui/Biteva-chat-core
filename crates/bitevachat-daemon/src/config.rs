@@ -32,7 +32,7 @@ impl CliArgs {
             data_dir: None,
             listen_addr: None,
             rpc_port: None,
-            relay_server: false,
+            relay_server: true,
             enable_mdns: None,
             bootstrap_nodes: Vec::new(),
             new_wallet: false,
