@@ -2,8 +2,8 @@
 //!
 //! [`BitevachatSwarm`] encapsulates the libp2p `Swarm` with the
 //! combined [`BitevachatBehaviour`] and provides an async event loop
-//! for message routing, gossip, DHT discovery, **and relay-based
-//! NAT traversal**.
+//! for message routing, gossip, DHT discovery, **relay-based NAT
+//! traversal**, and **application-level message forwarding**.
 //!
 //! # Relay architecture
 //!
@@ -14,6 +14,14 @@
 //!   autonat                  autonat                     autonat
 //!   dcutr (hole punch)       dcutr                       dcutr (hole punch)
 //! ```
+//!
+//! # Application-level forwarding
+//!
+//! Public/VPS nodes act as store-and-forward relays. When a message
+//! arrives whose `recipient` does not match this node's own address,
+//! the VPS validates the signature (anti-spam) and forwards the
+//! original [`WireMessage`] to the actual recipient, preserving the
+//! sender's public key so the final recipient can verify authenticity.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -43,7 +51,7 @@ use crate::discovery::{
 };
 use crate::events::NetworkEvent;
 use crate::gossip::{self, subscribe_default_topics};
-use crate::handler::{MessageHandler, DEFAULT_MAX_TIMESTAMP_SKEW_SECS};
+use crate::handler::MessageHandler;
 use crate::identity::wallet_keypair_to_libp2p;
 use crate::nat::NatManager;
 use crate::protocol::{Ack, WireMessage, MSG_PROTOCOL};
@@ -60,26 +68,15 @@ type BResult<T> = std::result::Result<T, BitevachatError>;
 // ---------------------------------------------------------------------------
 
 /// Combined libp2p behaviour for Bitevachat.
-///
-/// The `#[derive(NetworkBehaviour)]` macro auto-generates
-/// `BitevachatBehaviourEvent` with one variant per field.
 #[derive(NetworkBehaviour)]
 pub struct BitevachatBehaviour {
-    /// Kademlia + Identify.
     pub discovery: DiscoveryBehaviour,
-    /// Direct message send/receive with ACK (CBOR codec).
     pub messaging: libp2p_request_response::cbor::Behaviour<WireMessage, Ack>,
-    /// Pub/sub for presence and profile updates.
     pub gossip: gossipsub::Behaviour,
-    /// mDNS for automatic LAN peer discovery.
     pub mdns: mdns::tokio::Behaviour,
-    /// Relay client -- connect through relay nodes when behind NAT.
     pub relay_client: relay::client::Behaviour,
-    /// Relay server (VPS only). Wrapped in Toggle so it can be disabled.
     pub relay_server: Toggle<relay::Behaviour>,
-    /// AutoNAT -- probes peers to detect NAT status.
     pub autonat: autonat::Behaviour,
-    /// DCUtR -- upgrades relay circuits to direct connections.
     pub dcutr: dcutr::Behaviour,
 }
 
@@ -94,11 +91,9 @@ pub struct BitevachatSwarm {
     event_sender: mpsc::UnboundedSender<NetworkEvent>,
     address_book: HashMap<[u8; 32], PeerId>,
     local_sender_pubkey: [u8; 32],
-    /// Known relay nodes (PeerId + base Multiaddr without /p2p).
+    local_address: Address,
     relay_nodes: Vec<(PeerId, Multiaddr)>,
-    /// NAT status manager.
     nat_manager: NatManager,
-    /// Whether relay reservations are active.
     relay_reservations_active: bool,
 }
 
@@ -113,16 +108,15 @@ impl BitevachatSwarm {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let nonce_cache = Arc::new(Mutex::new(NonceCache::new(10_000)));
 
+        // Build handler with default asymmetric timestamp tolerances.
         let handler = MessageHandler::new(
             Arc::clone(&nonce_cache),
-            DEFAULT_MAX_TIMESTAMP_SKEW_SECS,
             event_tx.clone(),
         );
         let router = Router::new();
 
         // CRITICAL: `.with_relay_client()` MUST be called so the
-        // transport layer can create relay circuits.  Without it,
-        // `/p2p-circuit` multiaddrs cannot be dialed or listened on.
+        // transport layer can create relay circuits.
         let config_clone = config.clone();
         let signing_keypair = libp2p_keypair.clone();
 
@@ -155,13 +149,20 @@ impl BitevachatSwarm {
             })
             .build();
 
+        let local_pubkey_bytes = *wallet_keypair.public_key().as_bytes();
+        let local_pk = PublicKey::from_bytes(local_pubkey_bytes);
+        let local_address = pubkey_to_address(&local_pk);
+
+        tracing::info!(%local_address, "swarm initialized with local address");
+
         let me = Self {
             swarm,
             handler,
             router,
             event_sender: event_tx,
             address_book: HashMap::new(),
-            local_sender_pubkey: *wallet_keypair.public_key().as_bytes(),
+            local_sender_pubkey: local_pubkey_bytes,
+            local_address,
             relay_nodes: Vec::new(),
             nat_manager: NatManager::new(),
             relay_reservations_active: false,
@@ -172,6 +173,10 @@ impl BitevachatSwarm {
 
     pub fn local_peer_id(&self) -> &PeerId {
         self.swarm.local_peer_id()
+    }
+
+    pub fn local_address(&self) -> &Address {
+        &self.local_address
     }
 
     // -----------------------------------------------------------------------
@@ -199,7 +204,6 @@ impl BitevachatSwarm {
     // Relay operations
     // -----------------------------------------------------------------------
 
-    /// Registers relay nodes from bootstrap multiaddrs.
     pub fn register_relay_nodes(&mut self, nodes: &[Multiaddr]) {
         for addr in nodes {
             if let Some((peer_id, clean_addr)) = extract_peer_id_and_addr(addr) {
@@ -215,8 +219,6 @@ impl BitevachatSwarm {
         }
     }
 
-    /// Listens on `/p2p-circuit` through all known relay nodes.
-    /// Makes the local node reachable via relay by other NAT peers.
     pub fn listen_on_relays(&mut self) -> BResult<()> {
         if self.relay_nodes.is_empty() {
             tracing::debug!("no relay nodes registered, skipping relay listen");
@@ -259,7 +261,6 @@ impl BitevachatSwarm {
         &self.relay_nodes
     }
 
-    /// Attempts to dial a peer through known relay nodes.
     pub fn dial_via_relay(&mut self, target_peer_id: &PeerId) -> BResult<bool> {
         if self.relay_nodes.is_empty() {
             return Ok(false);
@@ -323,12 +324,6 @@ impl BitevachatSwarm {
         &self.local_sender_pubkey
     }
 
-    /// Attempts to deliver a message to a recipient by Address.
-    ///
-    /// 1. Resolve Address -> PeerId.
-    /// 2. If directly connected -> send immediately.
-    /// 3. If not connected -> try dialing via relay circuit.
-    /// 4. Return error (message stays in pending queue for retry).
     pub fn try_deliver_to_address(
         &mut self,
         recipient: &Address,
@@ -344,7 +339,6 @@ impl BitevachatSwarm {
             }
         })?;
 
-        // FAST PATH: peer is directly connected -> send now.
         if self.swarm.is_connected(&peer_id) {
             let sender_pubkey = self.local_sender_pubkey;
             self.send_message_to_peer(peer_id, envelope, sender_pubkey, message_id)?;
@@ -355,9 +349,6 @@ impl BitevachatSwarm {
             return Ok(());
         }
 
-        // RELAY FALLBACK: peer known but not connected.
-        // Initiate relay dial; message stays in pending queue and
-        // will be retried once the relayed connection is up.
         match self.dial_via_relay(&peer_id) {
             Ok(true) => {
                 tracing::info!(
@@ -457,6 +448,44 @@ impl BitevachatSwarm {
 
         self.router.track_send(request_id, message_id, recipient, envelope);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Application-level forwarding
+    // -----------------------------------------------------------------------
+
+    fn forward_message(&mut self, wire: WireMessage, recipient: &Address) {
+        let recipient_display = recipient.to_string();
+
+        let peer_id = match self.resolve_address(recipient) {
+            Some(pid) => pid,
+            None => {
+                tracing::warn!(
+                    %recipient_display,
+                    "*** FORWARD FAILED: no PeerId known for recipient ***"
+                );
+                return;
+            }
+        };
+
+        if !self.swarm.is_connected(&peer_id) {
+            tracing::warn!(
+                %recipient_display, %peer_id,
+                "*** FORWARD FAILED: recipient not connected ***"
+            );
+            return;
+        }
+
+        let _request_id = self
+            .swarm
+            .behaviour_mut()
+            .messaging
+            .send_request(&peer_id, wire);
+
+        tracing::info!(
+            %recipient_display, %peer_id,
+            "*** FORWARDED message to recipient ***"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -626,9 +655,9 @@ impl BitevachatSwarm {
     }
 
     fn handle_dcutr_event(&mut self, event: dcutr::Event) {
-        // Log all DCUtR events. The exact variant names differ across
-        // libp2p versions, so we use Debug formatting for portability.
-        tracing::info!(?event, "DCUtR event");
+        // dcutr::Event variant names differ across libp2p versions.
+        // Use Debug formatting for safe, version-agnostic logging.
+        tracing::info!(?event, "DCUtR event received");
     }
 
     fn handle_mdns_event(&mut self, event: mdns::Event) {
@@ -670,19 +699,59 @@ impl BitevachatSwarm {
                 let sender_bytes = *wire.envelope.message.sender.as_bytes();
                 self.address_book.insert(sender_bytes, peer);
 
-                let result = self
-                    .handler
-                    .on_message_received(peer, wire.envelope, &wire.sender_pubkey)
-                    .await;
+                let msg_recipient = &wire.envelope.message.recipient;
+                let is_for_us = msg_recipient.as_bytes() == self.local_address.as_bytes();
 
-                if self
-                    .swarm
-                    .behaviour_mut()
-                    .messaging
-                    .send_response(channel, result.ack.clone())
-                    .is_err()
-                {
-                    tracing::warn!(%peer, "failed to send ACK (channel closed)");
+                if is_for_us {
+                    let result = self
+                        .handler
+                        .on_message_received(peer, wire.envelope, &wire.sender_pubkey)
+                        .await;
+
+                    if self
+                        .swarm
+                        .behaviour_mut()
+                        .messaging
+                        .send_response(channel, result.ack.clone())
+                        .is_err()
+                    {
+                        tracing::warn!(%peer, "failed to send ACK (channel closed)");
+                    }
+                } else {
+                    let recipient = msg_recipient.clone();
+
+                    tracing::info!(
+                        sender = %wire.envelope.message.sender,
+                        %recipient,
+                        "inbound message not for us -- attempting relay forward"
+                    );
+
+                    match self.handler.validate_signature_only(&wire.envelope, &wire.sender_pubkey) {
+                        Ok(()) => {
+                            if self
+                                .swarm
+                                .behaviour_mut()
+                                .messaging
+                                .send_response(channel, Ack::Ok)
+                                .is_err()
+                            {
+                                tracing::warn!(%peer, "failed to send relay ACK");
+                            }
+
+                            self.forward_message(wire, &recipient);
+                        }
+                        Err(ack) => {
+                            tracing::warn!(
+                                %peer,
+                                "relay: rejecting message with invalid signature"
+                            );
+                            let _ = self
+                                .swarm
+                                .behaviour_mut()
+                                .messaging
+                                .send_response(channel, ack);
+                        }
+                    }
                 }
             }
 
@@ -945,7 +1014,6 @@ fn build_combined_behaviour(
             reason: format!("failed to create mDNS behaviour: {e}"),
         })?;
 
-    // Relay server: only enabled on VPS nodes.
     let relay_server = if config.enable_relay_server {
         tracing::info!("relay SERVER enabled -- this node will relay for others");
         Toggle::from(Some(relay::Behaviour::new(

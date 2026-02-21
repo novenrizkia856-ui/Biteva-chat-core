@@ -10,10 +10,18 @@
 //!
 //! 1. Verify sender pubkey matches sender address.
 //! 2. Verify Ed25519 signature (BEFORE any decryption).
-//! 3. Validate timestamp skew.
+//! 3. Validate timestamp skew (asymmetric: strict for future, lenient for past).
 //! 4. Validate nonce (replay detection).
 //! 5. Emit [`NetworkEvent::MessageReceived`].
 //! 6. Return [`Ack::Ok`].
+//!
+//! # Relay forwarding
+//!
+//! Public/VPS nodes that forward messages on behalf of NAT-ed clients
+//! use [`MessageHandler::validate_signature_only`] which only checks
+//! steps 1–2 (pubkey binding + signature). Timestamp and nonce
+//! validation are delegated to the final recipient, because relay
+//! latency and pending-queue retries can cause legitimate skew.
 
 use std::sync::{Arc, Mutex};
 
@@ -32,17 +40,25 @@ use crate::protocol::Ack;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Default maximum allowed clock skew for FUTURE timestamps
-/// (message claims to be from the future -- strict: 5 minutes).
-pub const DEFAULT_MAX_TIMESTAMP_SKEW_SECS: u64 = 300;
-
-/// Maximum allowed age for PAST timestamps.
+/// Default maximum allowed clock skew for FUTURE timestamps (10 minutes).
 ///
-/// Messages relayed through circuit relays or retried from the
-/// pending queue can arrive significantly later than their creation
-/// time.  We allow up to 30 minutes of past drift to accommodate
-/// relay setup, pending retries, and modest clock differences.
-pub const MAX_PAST_TIMESTAMP_SKEW_SECS: u64 = 1800;
+/// A message claiming to be from the future is suspicious — strict limit.
+pub const DEFAULT_MAX_FUTURE_SKEW_SECS: u64 = 600;
+
+/// Default maximum allowed clock skew for PAST timestamps (30 minutes).
+///
+/// Messages can legitimately arrive late due to:
+/// - Relay circuit establishment latency
+/// - Pending queue retries
+/// - NTP drift between NAT-ed clients
+/// - Store-and-forward delays on VPS nodes
+///
+/// The lenient past tolerance accommodates these real-world delays.
+pub const DEFAULT_MAX_PAST_SKEW_SECS: u64 = 1800;
+
+/// Legacy constant kept for backward compatibility.
+/// New code should use the asymmetric constants above.
+pub const DEFAULT_MAX_TIMESTAMP_SKEW_SECS: u64 = DEFAULT_MAX_FUTURE_SKEW_SECS;
 
 // ---------------------------------------------------------------------------
 // HandlerResult
@@ -67,30 +83,58 @@ pub struct MessageHandler {
     /// Bounded FIFO nonce cache for replay detection.
     nonce_cache: Arc<Mutex<NonceCache>>,
 
-    /// Maximum allowed clock skew in seconds.
-    max_timestamp_skew_secs: u64,
+    /// Maximum allowed clock skew for FUTURE timestamps (seconds).
+    max_future_skew_secs: u64,
+
+    /// Maximum allowed clock skew for PAST timestamps (seconds).
+    /// Lenient to accommodate relay delays, pending retries, NTP drift.
+    max_past_skew_secs: u64,
 
     /// Channel for emitting validated network events.
     event_sender: mpsc::UnboundedSender<NetworkEvent>,
 }
 
 impl MessageHandler {
-    /// Creates a new handler.
+    /// Creates a new handler with default asymmetric timestamp tolerance.
+    ///
+    /// - Future skew: 10 minutes (strict — prevents clock-ahead attacks)
+    /// - Past skew: 30 minutes (lenient — accommodates relay + retry delays)
     ///
     /// # Parameters
     ///
     /// - `nonce_cache` — shared nonce cache (same instance across
     ///   all handler invocations).
-    /// - `max_timestamp_skew_secs` — maximum clock skew tolerance.
     /// - `event_sender` — channel for emitting `NetworkEvent`s.
     pub fn new(
         nonce_cache: Arc<Mutex<NonceCache>>,
-        max_timestamp_skew_secs: u64,
         event_sender: mpsc::UnboundedSender<NetworkEvent>,
     ) -> Self {
         Self {
             nonce_cache,
-            max_timestamp_skew_secs,
+            max_future_skew_secs: DEFAULT_MAX_FUTURE_SKEW_SECS,
+            max_past_skew_secs: DEFAULT_MAX_PAST_SKEW_SECS,
+            event_sender,
+        }
+    }
+
+    /// Creates a new handler with custom asymmetric timestamp tolerances.
+    ///
+    /// # Parameters
+    ///
+    /// - `nonce_cache` — shared nonce cache.
+    /// - `max_future_skew_secs` — maximum allowed future timestamp skew.
+    /// - `max_past_skew_secs` — maximum allowed past timestamp skew.
+    /// - `event_sender` — channel for emitting `NetworkEvent`s.
+    pub fn with_asymmetric_skew(
+        nonce_cache: Arc<Mutex<NonceCache>>,
+        max_future_skew_secs: u64,
+        max_past_skew_secs: u64,
+        event_sender: mpsc::UnboundedSender<NetworkEvent>,
+    ) -> Self {
+        Self {
+            nonce_cache,
+            max_future_skew_secs,
+            max_past_skew_secs,
             event_sender,
         }
     }
@@ -101,7 +145,7 @@ impl MessageHandler {
     ///
     /// 1. Verify `SHA3-256(sender_pubkey) == envelope.message.sender`.
     /// 2. Verify the Ed25519 signature over the canonical CBOR bytes.
-    /// 3. Check that the timestamp is within `±max_timestamp_skew_secs`.
+    /// 3. Validate timestamp skew (asymmetric: strict future, lenient past).
     /// 4. Check the nonce against the replay cache.
     /// 5. Emit `NetworkEvent::MessageReceived`.
     /// 6. Return `Ack::Ok`.
@@ -125,9 +169,6 @@ impl MessageHandler {
         }
 
         // Step 2: Verify Ed25519 signature (BEFORE decrypt).
-        //
-        // The signature covers the canonical CBOR encoding of the
-        // Message, as produced by bitevachat_protocol::canonical.
         let canonical_bytes = match to_canonical_cbor(&envelope.message) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -146,48 +187,37 @@ impl MessageHandler {
             };
         }
 
-        // Step 3: Validate timestamp skew (asymmetric).
+        // Step 3: Asymmetric timestamp validation.
         //
-        // Messages can arrive late due to relay circuits, pending
-        // queue retries, and network delays.  We use asymmetric
-        // skew limits:
-        //   - PAST:   message older than now → generous (30 min)
-        //   - FUTURE: message ahead of now   → strict   (5 min)
+        // diff_millis = now - msg_timestamp
+        //   positive → message is in the PAST  → check against max_past_skew
+        //   negative → message is in the FUTURE → check against max_future_skew
         //
-        // This prevents replay of ancient messages while tolerating
-        // legitimate delivery delays through relay nodes.
+        // This allows lenient tolerance for delayed delivery (relay circuits,
+        // pending retries) while still being strict about future timestamps.
         let now = Timestamp::now();
         let now_millis = now.as_datetime().timestamp_millis();
         let msg_millis = envelope.message.timestamp.as_datetime().timestamp_millis();
-        let diff = now_millis - msg_millis; // positive = message is in the past
+        let diff_millis = now_millis - msg_millis;
 
-        if diff > 0 {
-            // Message is from the past (normal case for relayed msgs).
-            let max_past_ms = (MAX_PAST_TIMESTAMP_SKEW_SECS as i64).saturating_mul(1000);
-            if diff > max_past_ms {
-                tracing::warn!(
-                    diff_ms = diff,
-                    max_past_ms,
-                    "message too old (past timestamp beyond limit)"
-                );
-                return HandlerResult {
-                    ack: Ack::InvalidTimestamp,
-                };
-            }
+        let allowed = if diff_millis >= 0 {
+            // Message is in the past — lenient tolerance.
+            (self.max_past_skew_secs as i64).saturating_mul(1000)
         } else {
-            // Message is from the future (clock ahead).
-            let future_diff = diff.abs();
-            let max_future_ms = (self.max_timestamp_skew_secs as i64).saturating_mul(1000);
-            if future_diff > max_future_ms {
-                tracing::warn!(
-                    diff_ms = future_diff,
-                    max_future_ms,
-                    "message from the future (timestamp ahead of local clock)"
-                );
-                return HandlerResult {
-                    ack: Ack::InvalidTimestamp,
-                };
-            }
+            // Message is in the future — strict tolerance.
+            (self.max_future_skew_secs as i64).saturating_mul(1000)
+        };
+
+        if diff_millis.abs() > allowed {
+            tracing::warn!(
+                diff_ms = diff_millis,
+                allowed_ms = allowed,
+                direction = if diff_millis >= 0 { "past" } else { "future" },
+                "timestamp outside allowed skew window"
+            );
+            return HandlerResult {
+                ack: Ack::InvalidTimestamp,
+            };
         }
 
         // Step 4: Nonce replay check.
@@ -217,17 +247,56 @@ impl MessageHandler {
         }
 
         // Step 5: Emit event (decryption is delegated to higher layer).
-        //
-        // The handler deliberately does NOT decrypt here; decryption
-        // requires the recipient's private key which the network
-        // layer should not hold. The node core layer handles
-        // decryption and storage upon receiving this event.
         let _ = self
             .event_sender
             .send(NetworkEvent::MessageReceived(envelope));
 
         // Step 6: ACK success.
         HandlerResult { ack: Ack::Ok }
+    }
+
+    /// Validates only the sender's identity and signature.
+    ///
+    /// Used by VPS/relay nodes when forwarding messages to the actual
+    /// recipient. Skips timestamp and nonce checks — those are the
+    /// final recipient's responsibility.
+    ///
+    /// This prevents spam and invalid messages from being forwarded,
+    /// while avoiding false rejections caused by relay latency.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` — signature is valid, safe to forward.
+    /// - `Err(Ack)` — invalid identity or signature.
+    pub fn validate_signature_only(
+        &self,
+        envelope: &MessageEnvelope,
+        sender_pubkey: &[u8; 32],
+    ) -> Result<(), Ack> {
+        // Step 1: Verify pubkey → address binding.
+        let pubkey = PublicKey::from_bytes(*sender_pubkey);
+        let derived_address = pubkey_to_address(&pubkey);
+        if derived_address.as_bytes() != envelope.message.sender.as_bytes() {
+            tracing::warn!("relay: sender pubkey does not match sender address");
+            return Err(Ack::InvalidSignature);
+        }
+
+        // Step 2: Verify Ed25519 signature.
+        let canonical_bytes = match to_canonical_cbor(&envelope.message) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(%e, "relay: failed to produce canonical CBOR");
+                return Err(Ack::InvalidSignature);
+            }
+        };
+
+        let signature = Signature::from_bytes(*envelope.signature.as_bytes());
+        if verify(&pubkey, &canonical_bytes, &signature).is_err() {
+            tracing::warn!("relay: invalid signature, refusing to forward");
+            return Err(Ack::InvalidSignature);
+        }
+
+        Ok(())
     }
 }
 
@@ -268,7 +337,7 @@ mod tests {
     fn setup_handler() -> (MessageHandler, mpsc::UnboundedReceiver<NetworkEvent>) {
         let cache = Arc::new(Mutex::new(NonceCache::new(1000)));
         let (tx, rx) = mpsc::unbounded_channel();
-        let handler = MessageHandler::new(cache, DEFAULT_MAX_TIMESTAMP_SKEW_SECS, tx);
+        let handler = MessageHandler::new(cache, tx);
         (handler, rx)
     }
 
@@ -319,5 +388,27 @@ mod tests {
             .on_message_received(peer_id, envelope, &pubkey)
             .await;
         assert_eq!(r2.ack, Ack::InvalidNonce);
+    }
+
+    #[tokio::test]
+    async fn validate_signature_only_accepts_valid() {
+        let (handler, _rx) = setup_handler();
+        let sender_kp = Keypair::from_seed(&[0x01; 32]);
+        let (envelope, pubkey) = make_test_envelope(&sender_kp);
+
+        assert!(handler.validate_signature_only(&envelope, &pubkey).is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_signature_only_rejects_wrong_pubkey() {
+        let (handler, _rx) = setup_handler();
+        let sender_kp = Keypair::from_seed(&[0x01; 32]);
+        let (envelope, _pubkey) = make_test_envelope(&sender_kp);
+
+        let wrong_pubkey = [0xFF; 32];
+        assert_eq!(
+            handler.validate_signature_only(&envelope, &wrong_pubkey),
+            Err(Ack::InvalidSignature)
+        );
     }
 }
