@@ -170,20 +170,26 @@ impl BitevachatApp {
                 self.request_messages();
             }
 
-            UiEvent::Messages(msgs) => {
+            UiEvent::Messages(mut msgs) => {
                 // Clear in-flight flag so next poll can request again.
                 self.messages_request_pending = false;
 
                 // Clear switching flag -- fresh messages have arrived.
                 self.chat.switching_convo = false;
 
-                // FIX: Only update messages if content actually changed.
+                // Sort by timestamp (ISO 8601 strings sort correctly
+                // in lexicographic order).  This ensures chronological
+                // display regardless of DB insertion order — critical
+                // for messages arriving via mailbox/relay with delay.
+                msgs.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+                // Only update messages if content actually changed.
                 // This prevents flicker from identical poll responses.
                 if !messages_equal(&self.chat.messages, &msgs) {
                     let had_fewer = msgs.len() > self.chat.messages.len();
                     self.chat.messages = msgs;
 
-                    // FIX: Only auto-scroll when NEW messages arrive,
+                    // Only auto-scroll when NEW messages arrive,
                     // not on every identical poll response.
                     if had_fewer {
                         self.chat.scroll_to_bottom = true;

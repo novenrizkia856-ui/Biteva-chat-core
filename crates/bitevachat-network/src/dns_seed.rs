@@ -8,9 +8,9 @@
 //! # DNS layout
 //!
 //! ```text
-//! _bitevachat._tcp.seed.bitevacapital.id.  IN SRV  10 10 93812 node1.seed.bitevacapital.id.
-//! _bitevachat._tcp.seed.bitevacapital.id.  IN SRV  10 10 93812 node2.seed.bitevacapital.id.
-//! _bitevachat._tcp.seed.bitevacapital.id.  IN SRV  20  5 93812 node3.seed.bitevacapital.id.
+//! _bitevachat._tcp.seed.bitevacapital.id.  IN SRV  10 10 39812 node1.seed.bitevacapital.id.
+//! _bitevachat._tcp.seed.bitevacapital.id.  IN SRV  10 10 39812 node2.seed.bitevacapital.id.
+//! _bitevachat._tcp.seed.bitevacapital.id.  IN SRV  20  5 39812 node3.seed.bitevacapital.id.
 //!
 //! node1.seed.bitevacapital.id.  IN A  82.25.62.154
 //! node2.seed.bitevacapital.id.  IN A  203.0.113.42
@@ -60,7 +60,7 @@ const SRV_SERVICE: &str = "_bitevachat._tcp";
 /// Even though SRV records carry a port field, all Bitevachat seed
 /// nodes MUST listen on this port.  The SRV port is validated and
 /// a warning is emitted if it differs.
-pub const SEED_PORT: u16 = 93812;
+pub const SEED_PORT: u16 = 39812;
 
 /// DNS resolution timeout.
 const DNS_TIMEOUT_SECS: u64 = 10;
@@ -107,7 +107,7 @@ struct SrvEntry {
 ///
 /// # Returns
 ///
-/// A list of `/ip4/<ip>/tcp/93812` or `/ip6/<ip>/tcp/93812`
+/// A list of `/ip4/<ip>/tcp/39812` or `/ip6/<ip>/tcp/39812`
 /// multiaddrs, sorted by SRV priority (ascending) then weight
 /// (descending).
 ///
@@ -226,14 +226,15 @@ pub async fn resolve_and_merge(
 async fn resolve_srv_records(srv_name: &str) -> BResult<Vec<SrvEntry>> {
     // Primary: try SRV-style resolution via lookup_host.
     //
-    // `lookup_host("_bitevachat._tcp.seed.bitevacapital.id:93812")`
+    // `lookup_host("_bitevachat._tcp.seed.bitevacapital.id:39812")`
     // on most systems will:
     //   (a) resolve SRV records if the resolver supports it, OR
     //   (b) fall through to A/AAAA resolution of the name.
     //
     // We try the SRV name first, then fall back to the bare domain.
     let srv_query = format!("{}:{}", srv_name, SEED_PORT);
-    match lookup_host(&srv_query).await {
+    let srv_result = lookup_host(&srv_query).await;
+    match srv_result {
         Ok(socket_addrs) => {
             let mut entries = Vec::new();
             for sa in socket_addrs {
@@ -266,7 +267,8 @@ async fn resolve_srv_records(srv_name: &str) -> BResult<Vec<SrvEntry>> {
         .unwrap_or(srv_name);
 
     let bare_query = format!("{}:{}", bare_domain, SEED_PORT);
-    match lookup_host(&bare_query).await {
+    let bare_result = lookup_host(&bare_query).await;
+    match bare_result {
         Ok(socket_addrs) => {
             let mut entries = Vec::new();
             for sa in socket_addrs {

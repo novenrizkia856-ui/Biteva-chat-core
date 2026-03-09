@@ -22,7 +22,7 @@ use bitevachat_types::{BitevachatError, Result};
 ///
 /// On startup, the node queries SRV records at
 /// `_bitevachat._tcp.<domain>` to discover the IP addresses of
-/// public seed nodes.  All seed nodes listen on port 93812.
+/// public seed nodes.  All seed nodes listen on port 39812.
 ///
 /// This replaces the old hardcoded `DEFAULT_BOOTSTRAP_NODES` list.
 /// Updating the DNS zone file is enough to add or remove seed
@@ -43,7 +43,7 @@ pub const DEFAULT_SEED_DOMAIN: &str = "seed.bitevacapital.id";
 /// Format: `/ip4/<ip>/tcp/<port>` (without `/p2p/<peer_id>`
 /// for peerless dials, or with `/p2p/<peer_id>` if known).
 pub const FALLBACK_BOOTSTRAP_NODES: &[&str] = &[
-    "/ip4/82.25.62.154/tcp/93812",
+    "/ip4/82.25.62.154/tcp/39812",
 ];
 
 
@@ -60,7 +60,7 @@ pub struct NetworkConfig {
 
     /// Multiaddr on which this node listens for incoming connections.
     ///
-    /// Default: `/ip6/::/tcp/93812`.
+    /// Default: `/ip6/::/tcp/39812`.
     #[serde(with = "multiaddr_serde")]
     pub listen_addr: Multiaddr,
 
@@ -86,7 +86,7 @@ pub struct NetworkConfig {
     /// These are merged with nodes discovered via DNS seeding.
     /// Each entry should be a multiaddr, optionally with a
     /// `/p2p/<peer_id>` component:
-    /// `/ip4/1.2.3.4/tcp/93812` or `/ip4/1.2.3.4/tcp/93812/p2p/12D3KooW...`
+    /// `/ip4/1.2.3.4/tcp/39812` or `/ip4/1.2.3.4/tcp/39812/p2p/12D3KooW...`
     #[serde(with = "multiaddr_vec_serde")]
     pub bootstrap_nodes: Vec<Multiaddr>,
 
@@ -233,7 +233,7 @@ impl Default for NetworkConfig {
         // expect()/unwrap() per project rules.
         let mut listen_addr = Multiaddr::empty();
         listen_addr.push(Protocol::Ip6(std::net::Ipv6Addr::UNSPECIFIED));
-        listen_addr.push(Protocol::Tcp(93812));
+        listen_addr.push(Protocol::Tcp(39812));
 
         Self {
             listen_addr,
@@ -598,12 +598,12 @@ mod tests {
         let nodes = config.fallback_bootstrap_nodes();
         // FALLBACK_BOOTSTRAP_NODES has at least one hardcoded entry.
         assert!(!nodes.is_empty());
-        assert!(nodes[0].to_string().contains("93812"));
+        assert!(nodes[0].to_string().contains("39812"));
     }
 
     #[test]
     fn fallback_bootstrap_nodes_includes_user_configured() {
-        let addr: Multiaddr = "/ip4/1.2.3.4/tcp/93812".parse().unwrap();
+        let addr: Multiaddr = "/ip4/1.2.3.4/tcp/39812".parse().unwrap();
         let config = NetworkConfig {
             bootstrap_nodes: vec![addr.clone()],
             ..NetworkConfig::default()
@@ -621,12 +621,12 @@ mod tests {
     }
 
     #[test]
-    fn default_listen_port_is_93812() {
+    fn default_listen_port_is_39812() {
         let config = NetworkConfig::default();
         let addr_str = config.listen_addr.to_string();
         assert!(
-            addr_str.contains("93812"),
-            "default listen port should be 93812, got: {}",
+            addr_str.contains("39812"),
+            "default listen port should be 39812, got: {}",
             addr_str,
         );
     }
