@@ -227,8 +227,19 @@ impl BitevachatSwarm {
     // -----------------------------------------------------------------------
 
     pub fn register_relay_nodes(&mut self, nodes: &[Multiaddr]) {
+        let local = *self.swarm.local_peer_id();
+
         for addr in nodes {
             if let Some((peer_id, clean_addr)) = extract_peer_id_and_addr(addr) {
+                // Never register ourselves as a relay node.
+                if peer_id == local {
+                    tracing::debug!(
+                        %peer_id,
+                        "skipping self-registration as relay node"
+                    );
+                    continue;
+                }
+
                 if !self.relay_nodes.iter().any(|(p, _)| p == &peer_id) {
                     self.relay_nodes.push((peer_id, clean_addr.clone()));
                     tracing::info!(
@@ -247,8 +258,13 @@ impl BitevachatSwarm {
             return Ok(());
         }
 
+        let local = *self.swarm.local_peer_id();
         let nodes = self.relay_nodes.clone();
         for (peer_id, addr) in &nodes {
+            // Never listen on our own relay circuit.
+            if *peer_id == local {
+                continue;
+            }
             let circuit_listen =
                 relay_helpers::build_relay_listen_addr(addr, peer_id)?;
 
@@ -510,12 +526,30 @@ impl BitevachatSwarm {
     }
 
     pub fn bootstrap(&mut self, nodes: &[Multiaddr]) -> BResult<()> {
+        // Filter out our own address to prevent self-dial.
+        let local = *self.swarm.local_peer_id();
+        let filtered: Vec<Multiaddr> = nodes
+            .iter()
+            .filter(|addr| {
+                extract_peer_id_and_addr(addr)
+                    .map_or(true, |(pid, _)| pid != local)
+            })
+            .cloned()
+            .collect();
+
+        if filtered.is_empty() && !nodes.is_empty() {
+            tracing::debug!(
+                "all bootstrap nodes filtered out (self-references only)"
+            );
+            return Ok(());
+        }
+
         self.swarm
             .behaviour_mut()
             .discovery
-            .add_bootstrap_nodes(nodes)?;
+            .add_bootstrap_nodes(&filtered)?;
 
-        if !nodes.is_empty() {
+        if !filtered.is_empty() {
             self.swarm
                 .behaviour_mut()
                 .discovery
