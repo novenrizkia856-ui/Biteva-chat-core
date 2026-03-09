@@ -168,11 +168,23 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
                     }
                 }
 
-                // Log network health.
+                // Purge expired mailbox entries.
+                let mailbox_purged = rt.network.purge_mailbox();
+                if mailbox_purged > 0 {
+                    tracing::info!(
+                        purged = mailbox_purged,
+                        "maintenance: purged expired mailbox entries"
+                    );
+                }
+
+                // Log network health (including mailbox stats).
                 let peers = rt.network.connected_peers();
+                let mbox_stats = rt.network.mailbox_stats();
                 tracing::info!(
                     connected_peers = peers.len(),
                     relay_active = rt.network.relay_active(),
+                    mailbox_messages = mbox_stats.total_messages,
+                    mailbox_recipients = mbox_stats.recipient_count,
                     "maintenance: network health check"
                 );
             }

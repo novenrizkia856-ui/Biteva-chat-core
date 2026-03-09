@@ -44,8 +44,8 @@ pub const DEFAULT_BOOTSTRAP_NODES: &[&str] = &[
 /// Network-layer configuration.
 ///
 /// Controls listening addresses, bootstrap peers, connection
-/// limits, timeout durations, and NAT traversal settings for the
-/// libp2p swarm.
+/// limits, timeout durations, NAT traversal settings, and
+/// store-and-forward mailbox parameters for the libp2p swarm.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetworkConfig {
     // -----------------------------------------------------------------------
@@ -172,6 +172,35 @@ pub struct NetworkConfig {
     /// Format: `turn:<host>:<port>`. Credentials are provided
     /// separately at runtime.
     pub turn_servers: Vec<String>,
+
+    // -----------------------------------------------------------------------
+    // Store-and-forward mailbox
+    // -----------------------------------------------------------------------
+
+    /// Maximum messages stored per recipient in the mailbox.
+    ///
+    /// When exceeded, the oldest message for that recipient is
+    /// evicted (FIFO). This prevents a single address from
+    /// consuming all mailbox capacity.
+    ///
+    /// Default: `256`.
+    pub mailbox_max_per_recipient: usize,
+
+    /// Maximum total messages across all recipients in the mailbox.
+    ///
+    /// When reached, new messages are rejected. The sender's
+    /// pending queue will handle retries.
+    ///
+    /// Default: `10_000`.
+    pub mailbox_max_total: usize,
+
+    /// Time-to-live (in seconds) for mailbox entries.
+    ///
+    /// Messages older than this are purged during the maintenance
+    /// tick. The sender's pending queue will retry if needed.
+    ///
+    /// Default: `3600` (1 hour).
+    pub mailbox_ttl_secs: u64,
 }
 
 impl Default for NetworkConfig {
@@ -202,6 +231,10 @@ impl Default for NetworkConfig {
             relay_servers: Vec::new(),
             enable_turn: false,
             turn_servers: Vec::new(),
+            // Store-and-forward mailbox defaults
+            mailbox_max_per_recipient: 256,
+            mailbox_max_total: 10_000,
+            mailbox_ttl_secs: 3600,
         }
     }
 }
@@ -288,6 +321,23 @@ impl NetworkConfig {
         if self.enable_turn && self.turn_servers.is_empty() {
             return Err(BitevachatError::ConfigError {
                 reason: "enable_turn requires at least one turn_server".into(),
+            });
+        }
+
+        // Mailbox validation
+        if self.mailbox_max_per_recipient == 0 {
+            return Err(BitevachatError::ConfigError {
+                reason: "mailbox_max_per_recipient must be greater than 0".into(),
+            });
+        }
+        if self.mailbox_max_total == 0 {
+            return Err(BitevachatError::ConfigError {
+                reason: "mailbox_max_total must be greater than 0".into(),
+            });
+        }
+        if self.mailbox_ttl_secs == 0 {
+            return Err(BitevachatError::ConfigError {
+                reason: "mailbox_ttl_secs must be greater than 0".into(),
             });
         }
 
@@ -498,5 +548,53 @@ mod tests {
         let nodes = config.effective_bootstrap_nodes();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0], addr);
+    }
+
+    // Mailbox config tests
+
+    #[test]
+    fn zero_mailbox_per_recipient_rejected() {
+        let config = NetworkConfig {
+            mailbox_max_per_recipient: 0,
+            ..NetworkConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn zero_mailbox_max_total_rejected() {
+        let config = NetworkConfig {
+            mailbox_max_total: 0,
+            ..NetworkConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn zero_mailbox_ttl_rejected() {
+        let config = NetworkConfig {
+            mailbox_ttl_secs: 0,
+            ..NetworkConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn custom_mailbox_config_valid() {
+        let config = NetworkConfig {
+            mailbox_max_per_recipient: 512,
+            mailbox_max_total: 20_000,
+            mailbox_ttl_secs: 7200,
+            ..NetworkConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn default_mailbox_values() {
+        let config = NetworkConfig::default();
+        assert_eq!(config.mailbox_max_per_recipient, 256);
+        assert_eq!(config.mailbox_max_total, 10_000);
+        assert_eq!(config.mailbox_ttl_secs, 3600);
     }
 }

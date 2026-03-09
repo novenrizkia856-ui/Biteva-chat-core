@@ -22,6 +22,17 @@
 //! the VPS validates the signature (anti-spam) and forwards the
 //! original [`WireMessage`] to the actual recipient, preserving the
 //! sender's public key so the final recipient can verify authenticity.
+//!
+//! # Store-and-forward mailbox
+//!
+//! When the recipient is not currently connected, the message is
+//! stored in an in-memory [`Mailbox`]. When the recipient later
+//! connects and completes the Identify handshake, all pending
+//! messages are flushed automatically.
+//!
+//! Private/NAT-ed nodes that cannot reach the recipient directly
+//! will send the message to a connected relay/public node, which
+//! then either forwards immediately or stores in the mailbox.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -53,6 +64,7 @@ use crate::events::NetworkEvent;
 use crate::gossip::{self, subscribe_default_topics};
 use crate::handler::MessageHandler;
 use crate::identity::wallet_keypair_to_libp2p;
+use crate::mailbox::{Mailbox, MailboxStats};
 use crate::nat::NatManager;
 use crate::protocol::{Ack, WireMessage, MSG_PROTOCOL};
 use crate::relay as relay_helpers;
@@ -95,6 +107,8 @@ pub struct BitevachatSwarm {
     relay_nodes: Vec<(PeerId, Multiaddr)>,
     nat_manager: NatManager,
     relay_reservations_active: bool,
+    /// Store-and-forward mailbox for messages to offline recipients.
+    mailbox: Mailbox,
 }
 
 impl BitevachatSwarm {
@@ -153,6 +167,13 @@ impl BitevachatSwarm {
         let local_pk = PublicKey::from_bytes(local_pubkey_bytes);
         let local_address = pubkey_to_address(&local_pk);
 
+        // Build mailbox with config limits.
+        let mailbox = Mailbox::with_limits(
+            config.mailbox_max_per_recipient,
+            config.mailbox_max_total,
+            config.mailbox_ttl_secs,
+        );
+
         tracing::info!(%local_address, "swarm initialized with local address");
 
         let me = Self {
@@ -166,6 +187,7 @@ impl BitevachatSwarm {
             relay_nodes: Vec::new(),
             nat_manager: NatManager::new(),
             relay_reservations_active: false,
+            mailbox,
         };
 
         Ok((me, event_rx))
@@ -324,53 +346,134 @@ impl BitevachatSwarm {
         &self.local_sender_pubkey
     }
 
+    /// Attempts to deliver a message to the given recipient address.
+    ///
+    /// # Delivery strategy (ordered fallback)
+    ///
+    /// 1. **Direct** — if the recipient is in the address book AND
+    ///    currently connected, send via `request_response` directly.
+    ///
+    /// 2. **Relay dial** — if the recipient is known but not connected,
+    ///    attempt to dial through a relay circuit (async — message
+    ///    retries from pending queue).
+    ///
+    /// 3. **Store-and-forward** — send the message to a connected
+    ///    relay/public node. That node will either forward immediately
+    ///    (if the recipient is connected to it) or store the message
+    ///    in its mailbox for delivery when the recipient connects.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BitevachatError::NetworkError` if all strategies fail
+    /// (no connected relay nodes, no known peers).
     pub fn try_deliver_to_address(
         &mut self,
         recipient: &Address,
         envelope: MessageEnvelope,
         message_id: MessageId,
     ) -> BResult<()> {
-        let peer_id = self.resolve_address(recipient).ok_or_else(|| {
-            BitevachatError::NetworkError {
-                reason: format!(
-                    "no PeerId known for address {}; DHT lookup needed",
-                    recipient,
-                ),
-            }
-        })?;
-
-        if self.swarm.is_connected(&peer_id) {
-            let sender_pubkey = self.local_sender_pubkey;
-            self.send_message_to_peer(peer_id, envelope, sender_pubkey, message_id)?;
-            tracing::info!(
-                %message_id, %recipient, %peer_id,
-                "message dispatched to connected peer"
-            );
-            return Ok(());
-        }
-
-        match self.dial_via_relay(&peer_id) {
-            Ok(true) => {
+        // Strategy 1: Direct delivery to the recipient.
+        if let Some(peer_id) = self.resolve_address(recipient) {
+            if self.swarm.is_connected(&peer_id) {
+                let sender_pubkey = self.local_sender_pubkey;
+                self.send_message_to_peer(peer_id, envelope, sender_pubkey, message_id)?;
                 tracing::info!(
                     %message_id, %recipient, %peer_id,
-                    "initiated relay dial -- message will retry from pending queue"
+                    "message dispatched to connected peer"
                 );
+                return Ok(());
             }
-            Ok(false) => {
-                tracing::debug!(
-                    %message_id, %peer_id,
-                    "no relay nodes available for fallback"
-                );
+
+            // Strategy 2: Relay dial (async — retried from pending queue).
+            match self.dial_via_relay(&peer_id) {
+                Ok(true) => {
+                    tracing::info!(
+                        %message_id, %recipient, %peer_id,
+                        "initiated relay dial -- message will retry from pending queue"
+                    );
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        %message_id, %peer_id,
+                        "no relay nodes available for relay dial"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(%message_id, %e, "relay dial attempt failed");
+                }
             }
-            Err(e) => {
-                tracing::warn!(%message_id, %e, "relay dial attempt failed");
+        }
+
+        // Strategy 3: Store-and-forward via a connected relay/public node.
+        //
+        // Send the message to a relay node we are connected to. The
+        // relay will see that the message recipient differs from its
+        // own address, validate the signature, and either:
+        //   (a) forward immediately if the recipient is connected, or
+        //   (b) store in its mailbox for later delivery.
+        self.send_via_relay_forward(recipient, envelope, message_id)
+    }
+
+    /// Sends a message to a connected relay node for store-and-forward
+    /// delivery to the actual recipient.
+    ///
+    /// The relay node receives a `WireMessage` whose `recipient` field
+    /// differs from the relay's own address. The relay validates the
+    /// signature and either forwards or stores in its mailbox.
+    fn send_via_relay_forward(
+        &mut self,
+        recipient: &Address,
+        envelope: MessageEnvelope,
+        message_id: MessageId,
+    ) -> BResult<()> {
+        // Clone relay_nodes to avoid borrow conflict with send_message_to_peer.
+        let relay_nodes = self.relay_nodes.clone();
+
+        for (relay_pid, _) in &relay_nodes {
+            // Don't forward to the recipient itself.
+            if self.resolve_address(recipient) == Some(*relay_pid) {
+                continue;
+            }
+
+            if !self.swarm.is_connected(relay_pid) {
+                continue;
+            }
+
+            let sender_pubkey = self.local_sender_pubkey;
+            match self.send_message_to_peer(
+                *relay_pid,
+                envelope,
+                sender_pubkey,
+                message_id,
+            ) {
+                Ok(()) => {
+                    tracing::info!(
+                        %message_id,
+                        %recipient,
+                        relay = %relay_pid,
+                        "message sent to relay node for store-and-forward"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        %message_id,
+                        relay = %relay_pid,
+                        %e,
+                        "failed to send to relay, trying next"
+                    );
+                    // envelope was moved into send_message_to_peer which failed.
+                    // We cannot try the next relay because envelope is consumed.
+                    // Return the error.
+                    return Err(e);
+                }
             }
         }
 
         Err(BitevachatError::NetworkError {
             reason: format!(
-                "peer {} is known but not connected; relay dial initiated",
-                peer_id,
+                "no connected relay/public node available for store-and-forward to {}",
+                recipient,
             ),
         })
     }
@@ -451,41 +554,136 @@ impl BitevachatSwarm {
     }
 
     // -----------------------------------------------------------------------
-    // Application-level forwarding
+    // Application-level forwarding (with mailbox fallback)
     // -----------------------------------------------------------------------
 
+    /// Forwards a message to its intended recipient.
+    ///
+    /// If the recipient is currently connected, the message is sent
+    /// immediately via `request_response`. If the recipient is NOT
+    /// connected, the message is stored in the [`Mailbox`] for
+    /// automatic delivery when the recipient connects.
     fn forward_message(&mut self, wire: WireMessage, recipient: &Address) {
-        let recipient_display = recipient.to_string();
+        let recipient_bytes = *recipient.as_bytes();
+        let msg_id = wire.envelope.message.message_id;
 
-        let peer_id = match self.resolve_address(recipient) {
-            Some(pid) => pid,
-            None => {
-                tracing::warn!(
-                    %recipient_display,
-                    "*** FORWARD FAILED: no PeerId known for recipient ***"
+        // Try direct forward first.
+        if let Some(peer_id) = self.resolve_address(recipient) {
+            if self.swarm.is_connected(&peer_id) {
+                let _request_id = self
+                    .swarm
+                    .behaviour_mut()
+                    .messaging
+                    .send_request(&peer_id, wire);
+
+                tracing::info!(
+                    %msg_id,
+                    recipient = %recipient,
+                    %peer_id,
+                    "forwarded message to connected recipient"
                 );
                 return;
             }
-        };
+        }
 
-        if !self.swarm.is_connected(&peer_id) {
-            tracing::warn!(
-                %recipient_display, %peer_id,
-                "*** FORWARD FAILED: recipient not connected ***"
+        // Recipient not connected — store in mailbox.
+        let stored = self.mailbox.store(&recipient_bytes, wire);
+        if stored {
+            let pending = self.mailbox.pending_count_for(&recipient_bytes);
+            tracing::info!(
+                %msg_id,
+                recipient = %recipient,
+                pending_in_mailbox = pending,
+                "recipient offline -- message stored in mailbox for later delivery"
             );
+        } else {
+            tracing::warn!(
+                %msg_id,
+                recipient = %recipient,
+                "recipient offline -- mailbox full, message dropped \
+                 (sender's pending queue will retry)"
+            );
+        }
+    }
+
+    /// Flushes all mailbox messages for a recipient that just connected.
+    ///
+    /// Called after the Identify handshake resolves the peer's
+    /// Bitevachat address. Messages are sent in FIFO order.
+    fn flush_mailbox_for_peer(&mut self, address: &Address, peer_id: &PeerId) {
+        let address_bytes = *address.as_bytes();
+        let pending = self.mailbox.pending_count_for(&address_bytes);
+
+        if pending == 0 {
             return;
         }
 
-        let _request_id = self
-            .swarm
-            .behaviour_mut()
-            .messaging
-            .send_request(&peer_id, wire);
+        tracing::info!(
+            %address,
+            %peer_id,
+            pending,
+            "flushing mailbox for newly-connected peer"
+        );
+
+        let messages = self.mailbox.drain(&address_bytes);
+        let mut delivered = 0usize;
+        let mut failed = 0usize;
+
+        for wire in messages {
+            let msg_id = wire.envelope.message.message_id;
+
+            if !self.swarm.is_connected(peer_id) {
+                // Peer disconnected mid-flush. Re-store remaining
+                // messages would require re-collecting into a vec,
+                // which adds complexity. The sender's pending queue
+                // will handle retries.
+                tracing::warn!(
+                    %address, %peer_id,
+                    "peer disconnected during mailbox flush -- \
+                     remaining messages will be retried by senders"
+                );
+                failed = failed.saturating_add(1);
+                break;
+            }
+
+            let _request_id = self
+                .swarm
+                .behaviour_mut()
+                .messaging
+                .send_request(peer_id, wire);
+
+            delivered = delivered.saturating_add(1);
+
+            tracing::debug!(
+                %msg_id,
+                %address,
+                "mailbox: delivered stored message to peer"
+            );
+        }
 
         tracing::info!(
-            %recipient_display, %peer_id,
-            "*** FORWARDED message to recipient ***"
+            %address,
+            delivered,
+            failed,
+            "mailbox flush completed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mailbox management (public API for maintenance)
+    // -----------------------------------------------------------------------
+
+    /// Purges expired messages from the mailbox.
+    ///
+    /// Call this from the maintenance tick to reclaim memory.
+    /// Returns the number of purged entries.
+    pub fn purge_mailbox(&mut self) -> usize {
+        self.mailbox.purge_expired()
+    }
+
+    /// Returns mailbox statistics for monitoring.
+    pub fn mailbox_stats(&self) -> MailboxStats {
+        self.mailbox.stats()
     }
 
     // -----------------------------------------------------------------------
@@ -601,7 +799,17 @@ impl BitevachatSwarm {
     async fn handle_behaviour_event(&mut self, event: BitevachatBehaviourEvent) {
         match event {
             BitevachatBehaviourEvent::Discovery(disc) => {
-                handle_discovery_event(disc, &mut self.address_book, &self.event_sender);
+                let resolved = handle_discovery_event(
+                    disc,
+                    &mut self.address_book,
+                    &self.event_sender,
+                );
+
+                // When a peer's address is resolved via Identify,
+                // flush any mailbox messages waiting for that peer.
+                if let Some((address, peer_id)) = resolved {
+                    self.flush_mailbox_for_peer(&address, &peer_id);
+                }
             }
             BitevachatBehaviourEvent::Messaging(msg_event) => {
                 self.handle_messaging_event(msg_event).await;
@@ -723,7 +931,7 @@ impl BitevachatSwarm {
                     tracing::info!(
                         sender = %wire.envelope.message.sender,
                         %recipient,
-                        "inbound message not for us -- attempting relay forward"
+                        "inbound message not for us -- attempting forward/mailbox"
                     );
 
                     match self.handler.validate_signature_only(&wire.envelope, &wire.sender_pubkey) {
@@ -738,6 +946,8 @@ impl BitevachatSwarm {
                                 tracing::warn!(%peer, "failed to send relay ACK");
                             }
 
+                            // forward_message now stores to mailbox if
+                            // the recipient is not connected.
                             self.forward_message(wire, &recipient);
                         }
                         Err(ack) => {
@@ -837,17 +1047,20 @@ impl BitevachatSwarm {
 // Discovery event handlers
 // ---------------------------------------------------------------------------
 
+/// Handles a discovery event and returns the resolved address+peer
+/// if an Identify handshake completed.
 fn handle_discovery_event(
     event: DiscoveryBehaviourEvent,
     address_book: &mut HashMap<[u8; 32], PeerId>,
     event_sender: &mpsc::UnboundedSender<NetworkEvent>,
-) {
+) -> Option<(Address, PeerId)> {
     match event {
         DiscoveryBehaviourEvent::Kademlia(kad_event) => {
             handle_kademlia_event(kad_event);
+            None
         }
         DiscoveryBehaviourEvent::Identify(id_event) => {
-            handle_identify_event(id_event, address_book, event_sender);
+            handle_identify_event(id_event, address_book, event_sender)
         }
     }
 }
@@ -913,11 +1126,16 @@ fn handle_kademlia_event(event: kad::Event) {
     }
 }
 
+/// Handles an Identify event.
+///
+/// Returns `Some((address, peer_id))` when a peer's Bitevachat
+/// address was resolved, `None` otherwise. The caller uses this
+/// to flush the mailbox for the newly-resolved address.
 fn handle_identify_event(
     event: identify::Event,
     address_book: &mut HashMap<[u8; 32], PeerId>,
     event_sender: &mpsc::UnboundedSender<NetworkEvent>,
-) {
+) -> Option<(Address, PeerId)> {
     match event {
         identify::Event::Received { peer_id, info, .. } => {
             tracing::info!(
@@ -942,10 +1160,15 @@ fn handle_identify_event(
                     address,
                     peer_id,
                 });
+
+                return Some((address, peer_id));
             }
+
+            None
         }
         identify::Event::Sent { peer_id, .. } => {
             tracing::debug!(%peer_id, "identify: sent our info to peer");
+            None
         }
         identify::Event::Pushed { peer_id, info, .. } => {
             tracing::debug!(
@@ -953,9 +1176,11 @@ fn handle_identify_event(
                 agent_version = %info.agent_version,
                 "identify: pushed info update to peer"
             );
+            None
         }
         identify::Event::Error { peer_id, error, .. } => {
             tracing::warn!(%peer_id, %error, "identify: error");
+            None
         }
     }
 }

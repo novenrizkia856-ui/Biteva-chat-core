@@ -32,3 +32,4 @@ pub mod routing;
 pub mod swarm;
 pub mod transport;
 pub mod turn;
+pub mod mailbox;
