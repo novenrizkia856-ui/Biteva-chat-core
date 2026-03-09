@@ -33,3 +33,4 @@ pub mod swarm;
 pub mod transport;
 pub mod turn;
 pub mod mailbox;
+pub mod dns_seed;

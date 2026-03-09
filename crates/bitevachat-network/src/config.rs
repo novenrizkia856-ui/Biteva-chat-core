@@ -15,29 +15,35 @@ use serde::{Deserialize, Serialize};
 use bitevachat_types::{BitevachatError, Result};
 
 // ---------------------------------------------------------------------------
-// Well-known bootstrap nodes
+// DNS seed discovery
 // ---------------------------------------------------------------------------
 
-/// Default bootstrap nodes for the Bitevachat network.
+/// Default DNS seed domain for discovering bootstrap nodes.
 ///
-/// These are community-run nodes that serve as initial entry points
-/// to the Bitevachat Kademlia DHT.  They are NOT central servers —
-/// once a node has discovered peers through the DHT, it no longer
-/// needs them.  This is the same model Bitcoin uses with its DNS
-/// seed nodes.
+/// On startup, the node queries SRV records at
+/// `_bitevachat._tcp.<domain>` to discover the IP addresses of
+/// public seed nodes.  All seed nodes listen on port 93812.
 ///
-/// Anyone can run a bootstrap node by:
-/// 1. Running a Bitevachat node on a machine with a public IP.
-/// 2. Setting `enable_relay_server: true` in their config.
-/// 3. Sharing their multiaddr for inclusion in this list.
+/// This replaces the old hardcoded `DEFAULT_BOOTSTRAP_NODES` list.
+/// Updating the DNS zone file is enough to add or remove seed
+/// nodes — no binary rebuild or config push required.
 ///
-/// Format: `/ip4/<ip>/tcp/<port>/p2p/<peer_id>`
-///    or:  `/dns4/<domain>/tcp/<port>/p2p/<peer_id>`
+/// The DNS seed is **not a central server**.  It only provides
+/// initial peer addresses for joining the Kademlia DHT.  Once
+/// connected to the DHT, the node discovers additional peers
+/// through normal DHT operations.
+pub const DEFAULT_SEED_DOMAIN: &str = "seed.bitevacapital.id";
+
+/// Hardcoded fallback bootstrap nodes.
 ///
-/// If this list is empty, the node relies on mDNS (LAN only) or
-/// manually-configured `bootstrap_nodes` in the user's config file.
-pub const DEFAULT_BOOTSTRAP_NODES: &[&str] = &[
-    "/ip4/82.25.62.154/tcp/9000/p2p/12D3KooWSHeD7z6JgoMXTuiwdfyrCHLrxYXEArHc7DGxfVPVuFS2",
+/// Used when DNS resolution fails (timeout, NXDOMAIN, network
+/// error).  These should be long-lived, well-known public nodes
+/// with stable PeerIds (persisted keypairs).
+///
+/// Format: `/ip4/<ip>/tcp/<port>` (without `/p2p/<peer_id>`
+/// for peerless dials, or with `/p2p/<peer_id>` if known).
+pub const FALLBACK_BOOTSTRAP_NODES: &[&str] = &[
+    "/ip4/82.25.62.154/tcp/93812",
 ];
 
 
@@ -54,15 +60,33 @@ pub struct NetworkConfig {
 
     /// Multiaddr on which this node listens for incoming connections.
     ///
-    /// Default: `/ip4/0.0.0.0/tcp/0` (OS-assigned port on all interfaces).
+    /// Default: `/ip6/::/tcp/93812`.
     #[serde(with = "multiaddr_serde")]
     pub listen_addr: Multiaddr,
 
-    /// Bootstrap nodes to connect to on startup.
+    /// DNS seed domain for discovering bootstrap nodes.
     ///
-    /// Each entry must be a fully-qualified multiaddr containing a
-    /// `/p2p/<peer_id>` component, e.g.:
-    /// `/ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...`
+    /// On startup, the node queries SRV records at
+    /// `_bitevachat._tcp.<domain>` to find public seed node IPs.
+    /// Set to an empty string to disable DNS seeding.
+    ///
+    /// Default: `seed.bitevacapital.id`.
+    pub dns_seed_domain: String,
+
+    /// Enable DNS-based seed discovery.
+    ///
+    /// When disabled, only `bootstrap_nodes` and hardcoded fallbacks
+    /// are used.
+    ///
+    /// Default: `true`.
+    pub dns_seed_enabled: bool,
+
+    /// Additional bootstrap nodes to connect to on startup.
+    ///
+    /// These are merged with nodes discovered via DNS seeding.
+    /// Each entry should be a multiaddr, optionally with a
+    /// `/p2p/<peer_id>` component:
+    /// `/ip4/1.2.3.4/tcp/93812` or `/ip4/1.2.3.4/tcp/93812/p2p/12D3KooW...`
     #[serde(with = "multiaddr_vec_serde")]
     pub bootstrap_nodes: Vec<Multiaddr>,
 
@@ -209,10 +233,12 @@ impl Default for NetworkConfig {
         // expect()/unwrap() per project rules.
         let mut listen_addr = Multiaddr::empty();
         listen_addr.push(Protocol::Ip6(std::net::Ipv6Addr::UNSPECIFIED));
-        listen_addr.push(Protocol::Tcp(27300));
+        listen_addr.push(Protocol::Tcp(93812));
 
         Self {
             listen_addr,
+            dns_seed_domain: DEFAULT_SEED_DOMAIN.into(),
+            dns_seed_enabled: true,
             bootstrap_nodes: Vec::new(),
             max_connections: 128,
             idle_timeout_secs: 60,
@@ -240,14 +266,15 @@ impl Default for NetworkConfig {
 }
 
 impl NetworkConfig {
-    /// Returns the effective list of bootstrap nodes: hardcoded
-    /// defaults merged with user-configured nodes (deduplicated).
+    /// Returns the synchronous (non-DNS) bootstrap node list.
     ///
-    /// Hardcoded defaults from [`DEFAULT_BOOTSTRAP_NODES`] are
-    /// always included.  User-configured `bootstrap_nodes` are
-    /// appended.  Duplicates are removed.
-    pub fn effective_bootstrap_nodes(&self) -> Vec<Multiaddr> {
-        let mut nodes: Vec<Multiaddr> = DEFAULT_BOOTSTRAP_NODES
+    /// Merges hardcoded fallback nodes with user-configured
+    /// `bootstrap_nodes`.  This does NOT include DNS-resolved seeds.
+    ///
+    /// For the full list including DNS seeds, use
+    /// [`resolve_bootstrap_nodes`](Self::resolve_bootstrap_nodes).
+    pub fn fallback_bootstrap_nodes(&self) -> Vec<Multiaddr> {
+        let mut nodes: Vec<Multiaddr> = FALLBACK_BOOTSTRAP_NODES
             .iter()
             .filter_map(|s| s.parse::<Multiaddr>().ok())
             .collect();
@@ -259,6 +286,42 @@ impl NetworkConfig {
         }
 
         nodes
+    }
+
+    /// Resolves the complete bootstrap node list: DNS seeds merged
+    /// with fallback/config nodes.
+    ///
+    /// # Resolution order
+    ///
+    /// 1. Query DNS SRV records at `_bitevachat._tcp.<dns_seed_domain>`.
+    /// 2. Merge with hardcoded `FALLBACK_BOOTSTRAP_NODES`.
+    /// 3. Merge with user-configured `bootstrap_nodes`.
+    /// 4. Deduplicate and cap at 64.
+    ///
+    /// If DNS resolution fails, only fallback + config nodes are
+    /// returned.  DNS failure is never fatal.
+    pub async fn resolve_bootstrap_nodes(&self) -> Vec<Multiaddr> {
+        let fallback = self.fallback_bootstrap_nodes();
+
+        if !self.dns_seed_enabled || self.dns_seed_domain.is_empty() {
+            tracing::debug!("DNS seeding disabled, using fallback nodes only");
+            return fallback;
+        }
+
+        crate::dns_seed::resolve_and_merge(
+            Some(&self.dns_seed_domain),
+            &fallback,
+        )
+        .await
+    }
+
+    /// Legacy synchronous accessor.
+    ///
+    /// **Deprecated** — use [`resolve_bootstrap_nodes`](Self::resolve_bootstrap_nodes)
+    /// instead.  This exists for backward compatibility and returns
+    /// only the fallback/config nodes (no DNS seeds).
+    pub fn effective_bootstrap_nodes(&self) -> Vec<Multiaddr> {
+        self.fallback_bootstrap_nodes()
     }
 
     /// Validates all configuration values.
@@ -530,24 +593,42 @@ mod tests {
     }
 
     #[test]
-    fn effective_bootstrap_nodes_empty_by_default() {
+    fn fallback_bootstrap_nodes_includes_hardcoded() {
         let config = NetworkConfig::default();
-        // DEFAULT_BOOTSTRAP_NODES is currently empty, so
-        // effective list should also be empty.
-        let nodes = config.effective_bootstrap_nodes();
-        assert!(nodes.is_empty());
+        let nodes = config.fallback_bootstrap_nodes();
+        // FALLBACK_BOOTSTRAP_NODES has at least one hardcoded entry.
+        assert!(!nodes.is_empty());
+        assert!(nodes[0].to_string().contains("93812"));
     }
 
     #[test]
-    fn effective_bootstrap_nodes_includes_user_configured() {
-        let addr: Multiaddr = "/ip4/1.2.3.4/tcp/9000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".parse().unwrap();
+    fn fallback_bootstrap_nodes_includes_user_configured() {
+        let addr: Multiaddr = "/ip4/1.2.3.4/tcp/93812".parse().unwrap();
         let config = NetworkConfig {
             bootstrap_nodes: vec![addr.clone()],
             ..NetworkConfig::default()
         };
-        let nodes = config.effective_bootstrap_nodes();
+        let nodes = config.fallback_bootstrap_nodes();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0], addr);
+    }
+
+    #[test]
+    fn default_dns_seed_config() {
+        let config = NetworkConfig::default();
+        assert_eq!(config.dns_seed_domain, "seed.bitevacapital.id");
+        assert!(config.dns_seed_enabled);
+    }
+
+    #[test]
+    fn default_listen_port_is_93812() {
+        let config = NetworkConfig::default();
+        let addr_str = config.listen_addr.to_string();
+        assert!(
+            addr_str.contains("93812"),
+            "default listen port should be 93812, got: {}",
+            addr_str,
+        );
     }
 
     // Mailbox config tests

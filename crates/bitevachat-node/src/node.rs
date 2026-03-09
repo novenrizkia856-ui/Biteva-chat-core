@@ -218,7 +218,15 @@ impl Node {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let listen_addr = net_config.listen_addr.clone();
-        let bootstrap_nodes = net_config.effective_bootstrap_nodes();
+
+        // Resolve bootstrap nodes: DNS seeds + fallback + config.
+        let bootstrap_nodes = net_config.resolve_bootstrap_nodes().await;
+        tracing::info!(
+            count = bootstrap_nodes.len(),
+            dns_seed = %net_config.dns_seed_domain,
+            dns_enabled = net_config.dns_seed_enabled,
+            "bootstrap nodes resolved"
+        );
 
         // Initialize anti-spam filter from config.
         let spam_config = crate::spam_filter::SpamConfig::from(&app_config);
