@@ -156,36 +156,55 @@ impl DiscoveryBehaviour {
 
     /// Adds bootstrap nodes to the Kademlia routing table.
     ///
-    /// Each multiaddr must contain a `/p2p/<peer_id>` component.
-    /// Addresses without a peer ID are skipped with a warning.
+    /// Nodes **with** a `/p2p/<peer_id>` component are added directly
+    /// to the Kademlia routing table.
+    ///
+    /// Nodes **without** a `/p2p/<peer_id>` component (peerless) are
+    /// returned in the `Ok` result so the caller can dial them
+    /// directly.  After the dial succeeds and Identify runs, the
+    /// peer will be added to the routing table automatically.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(peerless_addrs)` — multiaddrs that need to be dialed
+    /// because they lack a PeerId.
     ///
     /// # Errors
     ///
-    /// Returns `BitevachatError::NetworkError` if no valid bootstrap
-    /// addresses could be parsed.
-    pub fn add_bootstrap_nodes(&mut self, nodes: &[Multiaddr]) -> BResult<()> {
-        let mut added = 0usize;
+    /// Returns `BitevachatError::NetworkError` only if the node list
+    /// is non-empty but contains zero usable entries (neither
+    /// peered nor peerless).
+    pub fn add_bootstrap_nodes(&mut self, nodes: &[Multiaddr]) -> BResult<Vec<Multiaddr>> {
+        let mut added_to_kad = 0usize;
+        let mut peerless = Vec::new();
 
         for addr in nodes {
             match extract_peer_id(addr) {
                 Some((peer_id, clean_addr)) => {
                     self.kademlia.add_address(&peer_id, clean_addr);
-                    added += 1;
+                    added_to_kad = added_to_kad.saturating_add(1);
                     tracing::info!(%peer_id, %addr, "added bootstrap node to Kademlia routing table");
                 }
                 None => {
-                    tracing::warn!(%addr, "skipping bootstrap node: missing /p2p/ component");
+                    // Peerless multiaddr — cannot add to Kademlia
+                    // directly (it requires a PeerId).  Return to
+                    // caller for direct dial.  After Identify
+                    // handshake completes, the peer will be added
+                    // to the routing table automatically.
+                    tracing::info!(%addr, "peerless bootstrap node -- will dial directly");
+                    peerless.push(addr.clone());
                 }
             }
         }
 
-        if !nodes.is_empty() && added == 0 {
+        // Only fail if we got NOTHING usable at all.
+        if !nodes.is_empty() && added_to_kad == 0 && peerless.is_empty() {
             return Err(BitevachatError::NetworkError {
-                reason: "no valid bootstrap nodes found (all missing /p2p/ component)".into(),
+                reason: "no valid bootstrap nodes found".into(),
             });
         }
 
-        Ok(())
+        Ok(peerless)
     }
 
     /// Initiates a Kademlia bootstrap operation.

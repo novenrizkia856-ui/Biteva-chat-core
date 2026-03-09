@@ -625,12 +625,34 @@ impl BitevachatSwarm {
 
     pub fn bootstrap(&mut self, nodes: &[Multiaddr]) -> BResult<()> {
         // Filter out our own address to prevent self-dial.
+        // For nodes WITH PeerId: compare PeerId.
+        // For peerless nodes: compare IP address against our listeners.
         let local = *self.swarm.local_peer_id();
+        let my_listeners: Vec<String> = self
+            .swarm
+            .listeners()
+            .map(|a| a.to_string())
+            .collect();
+
         let filtered: Vec<Multiaddr> = nodes
             .iter()
             .filter(|addr| {
-                extract_peer_id_and_addr(addr)
-                    .map_or(true, |(pid, _)| pid != local)
+                // Filter by PeerId if present.
+                if let Some((pid, _)) = extract_peer_id_and_addr(addr) {
+                    if pid == local {
+                        tracing::debug!(%addr, "filtering self from bootstrap (PeerId match)");
+                        return false;
+                    }
+                }
+
+                // Filter peerless addrs that match our own listeners.
+                let addr_str = addr.to_string();
+                if my_listeners.iter().any(|l| l.starts_with(&addr_str)) {
+                    tracing::debug!(%addr, "filtering self from bootstrap (listener match)");
+                    return false;
+                }
+
+                true
             })
             .cloned()
             .collect();
@@ -642,16 +664,54 @@ impl BitevachatSwarm {
             return Ok(());
         }
 
-        self.swarm
+        // add_bootstrap_nodes returns peerless addrs that need direct dial.
+        let peerless = self
+            .swarm
             .behaviour_mut()
             .discovery
             .add_bootstrap_nodes(&filtered)?;
 
-        if !filtered.is_empty() {
-            self.swarm
-                .behaviour_mut()
-                .discovery
-                .bootstrap()?;
+        // Dial peerless nodes directly.  After the connection is
+        // established and Identify runs, the peer's PeerId will be
+        // resolved and added to the Kademlia routing table
+        // automatically (via handle_identify_event).
+        for addr in &peerless {
+            match self.swarm.dial(addr.clone()) {
+                Ok(()) => {
+                    tracing::info!(
+                        %addr,
+                        "dialing peerless bootstrap node"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %addr, %e,
+                        "failed to dial peerless bootstrap node"
+                    );
+                }
+            }
+        }
+
+        // Only run Kademlia bootstrap if we have peered nodes in
+        // the routing table.  For peerless-only scenarios, Kademlia
+        // bootstrap will succeed once Identify resolves the PeerIds.
+        let has_peered = filtered.len() > peerless.len();
+        if has_peered {
+            match self.swarm.behaviour_mut().discovery.bootstrap() {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        %e,
+                        "Kademlia bootstrap deferred (will run after Identify)"
+                    );
+                }
+            }
+        } else if !peerless.is_empty() {
+            tracing::info!(
+                count = peerless.len(),
+                "all bootstrap nodes are peerless -- Kademlia bootstrap \
+                 will run after Identify resolves PeerIds"
+            );
         }
 
         Ok(())
@@ -1099,9 +1159,42 @@ impl BitevachatSwarm {
                 );
 
                 // When a peer's address is resolved via Identify:
-                // 1. Flush any mailbox messages waiting for that peer.
-                // 2. Auto-register as relay if it qualifies.
+                // 1. Add to Kademlia routing table (critical for peerless bootstrap).
+                // 2. Flush any mailbox messages waiting for that peer.
+                // 3. Auto-register as relay if it qualifies.
                 if let Some(result) = resolved {
+                    // Add peer to Kademlia routing table with its
+                    // listen addresses.  This is essential for
+                    // peerless bootstrap: the peer was dialed without
+                    // a PeerId, so Kademlia didn't know about it
+                    // until Identify resolved the identity.
+                    for listen_addr in &result.public_listen_addrs {
+                        let clean = strip_p2p_component(listen_addr);
+                        self.swarm
+                            .behaviour_mut()
+                            .discovery
+                            .kademlia
+                            .add_address(&result.peer_id, clean);
+                    }
+
+                    // Trigger Kademlia bootstrap now that we have a
+                    // peer in the routing table.  Harmless if already
+                    // bootstrapped — Kademlia deduplicates internally.
+                    match self.swarm.behaviour_mut().discovery.bootstrap() {
+                        Ok(_) => {
+                            tracing::debug!(
+                                peer_id = %result.peer_id,
+                                "Kademlia bootstrap triggered after Identify"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                %e,
+                                "Kademlia bootstrap after Identify deferred"
+                            );
+                        }
+                    }
+
                     self.flush_mailbox_for_peer(&result.address, &result.peer_id);
 
                     self.auto_register_relay(
