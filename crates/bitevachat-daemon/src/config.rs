@@ -105,12 +105,12 @@ impl CliArgs {
 /// ```json
 /// {
 ///   "data_dir": "/opt/bitevachat/data",
-///   "listen_addr": "/ip4/0.0.0.0/tcp/9000",
+///   "listen_addr": "/ip4/0.0.0.0/tcp/39812",
 ///   "rpc_port": 50051,
 ///   "relay_server": true,
 ///   "enable_mdns": false,
 ///   "bootstrap_nodes": [
-///     "/ip4/203.0.113.1/tcp/9000/p2p/12D3KooW..."
+///     "/ip4/203.0.113.1/tcp/39812/p2p/12D3KooW..."
 ///   ]
 /// }
 /// ```
@@ -149,7 +149,7 @@ impl DaemonConfig {
             listen_addr: cli
                 .listen_addr
                 .clone()
-                .unwrap_or_else(|| "/ip4/0.0.0.0/tcp/9000".into()),
+                .unwrap_or_else(|| "/ip4/0.0.0.0/tcp/39812".into()),
             rpc_port: cli.rpc_port.unwrap_or(50051),
             relay_server: cli.relay_server,
             enable_mdns: cli.enable_mdns.unwrap_or(true),
@@ -174,7 +174,7 @@ impl DaemonConfig {
                 .unwrap_or_else(default_data_dir),
             listen_addr: file
                 .listen_addr
-                .unwrap_or_else(|| "/ip4/0.0.0.0/tcp/9000".into()),
+                .unwrap_or_else(|| "/ip4/0.0.0.0/tcp/39812".into()),
             rpc_port: file.rpc_port.unwrap_or(50051),
             relay_server: file.relay_server.unwrap_or(false),
             enable_mdns: file.enable_mdns.unwrap_or(true),
@@ -240,7 +240,7 @@ USAGE:
 
 OPTIONS:
     --data-dir <PATH>        Data directory (default: platform-specific)
-    --listen <MULTIADDR>     P2P listen address (default: /ip4/0.0.0.0/tcp/9000)
+    --listen <MULTIADDR>     P2P listen address (default: /ip4/0.0.0.0/tcp/39812)
     --rpc-port <PORT>        gRPC listen port (default: 50051)
     --relay-server           Enable relay server mode for public nodes
     --no-mdns                Disable mDNS local discovery
@@ -251,14 +251,14 @@ OPTIONS:
     -h, --help               Show this help
 
 EXAMPLES:
-    # First run: create wallet, listen on port 9000
-    bitevachat-daemon --new-wallet --listen /ip4/0.0.0.0/tcp/9000
+    # First run: create wallet, listen on port 39812
+    bitevachat-daemon --new-wallet --listen /ip4/0.0.0.0/tcp/39812
 
     # VPS bootstrap/relay node
-    bitevachat-daemon --relay-server --no-mdns --listen /ip4/0.0.0.0/tcp/9000
+    bitevachat-daemon --relay-server --no-mdns --listen /ip4/0.0.0.0/tcp/39812
 
     # Connect to existing bootstrap
-    bitevachat-daemon --bootstrap /ip4/1.2.3.4/tcp/9000/p2p/12D3KooW...
+    bitevachat-daemon --bootstrap /ip4/1.2.3.4/tcp/39812/p2p/12D3KooW...
 
     # Use config file
     bitevachat-daemon --config /etc/bitevachat/daemon.json
