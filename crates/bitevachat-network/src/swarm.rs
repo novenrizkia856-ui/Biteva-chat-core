@@ -626,12 +626,13 @@ impl BitevachatSwarm {
     pub fn bootstrap(&mut self, nodes: &[Multiaddr]) -> BResult<()> {
         // Filter out our own address to prevent self-dial.
         // For nodes WITH PeerId: compare PeerId.
-        // For peerless nodes: compare IP address against our listeners.
+        // For peerless nodes: compare IP address (ignoring port)
+        // against our listeners.
         let local = *self.swarm.local_peer_id();
-        let my_listeners: Vec<String> = self
+        let my_ips: Vec<String> = self
             .swarm
             .listeners()
-            .map(|a| a.to_string())
+            .filter_map(|a| extract_ip_from_multiaddr(a))
             .collect();
 
         let filtered: Vec<Multiaddr> = nodes
@@ -645,11 +646,17 @@ impl BitevachatSwarm {
                     }
                 }
 
-                // Filter peerless addrs that match our own listeners.
-                let addr_str = addr.to_string();
-                if my_listeners.iter().any(|l| l.starts_with(&addr_str)) {
-                    tracing::debug!(%addr, "filtering self from bootstrap (listener match)");
-                    return false;
+                // Filter peerless addrs whose IP matches any of our
+                // listener IPs (port-agnostic).
+                if let Some(addr_ip) = extract_ip_from_multiaddr(addr) {
+                    if my_ips.iter().any(|my_ip| *my_ip == addr_ip) {
+                        tracing::debug!(
+                            %addr,
+                            ip = %addr_ip,
+                            "filtering self from bootstrap (IP match)"
+                        );
+                        return false;
+                    }
                 }
 
                 true
@@ -1707,6 +1714,39 @@ fn is_public_ipv6(ip: std::net::Ipv6Addr) -> bool {
         && (ip.segments()[0] & 0xffc0) != 0xfe80
         // Unique local (fc00::/7).
         && (ip.segments()[0] & 0xfe00) != 0xfc00
+}
+
+// ---------------------------------------------------------------------------
+// Behaviour construction
+// ---------------------------------------------------------------------------
+
+/// Extracts the IP address string from a multiaddr (ignoring port).
+///
+/// Returns the IP as a string for comparison purposes.
+/// Handles IPv4, IPv6, and DNS names.
+/// Skips loopback addresses (127.x.x.x / ::1).
+fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<String> {
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::Ip4(ip) => {
+                if !ip.is_loopback() {
+                    return Some(ip.to_string());
+                }
+            }
+            libp2p::multiaddr::Protocol::Ip6(ip) => {
+                if !ip.is_loopback() {
+                    return Some(ip.to_string());
+                }
+            }
+            libp2p::multiaddr::Protocol::Dns4(host)
+            | libp2p::multiaddr::Protocol::Dns6(host)
+            | libp2p::multiaddr::Protocol::Dns(host) => {
+                return Some(host.to_string());
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
