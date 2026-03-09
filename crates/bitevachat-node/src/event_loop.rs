@@ -183,8 +183,10 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
                 tracing::info!(
                     connected_peers = peers.len(),
                     relay_active = rt.network.relay_active(),
+                    relay_nodes = rt.network.relay_nodes().len(),
                     mailbox_messages = mbox_stats.total_messages,
                     mailbox_recipients = mbox_stats.recipient_count,
+                    forward_cache = rt.network.forward_cache_len(),
                     "maintenance: network health check"
                 );
             }

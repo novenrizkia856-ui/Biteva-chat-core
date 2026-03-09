@@ -34,7 +34,7 @@
 //! will send the message to a connected relay/public node, which
 //! then either forwards immediately or stores in the mailbox.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,6 +76,101 @@ use crate::transport;
 type BResult<T> = std::result::Result<T, BitevachatError>;
 
 // ---------------------------------------------------------------------------
+// ForwardCache — dedup for cross-relay message forwarding
+// ---------------------------------------------------------------------------
+
+/// Default capacity for the forward cache.
+const FORWARD_CACHE_CAPACITY: usize = 10_000;
+
+/// Protocol string fragment that identifies relay v2 hop support.
+///
+/// Nodes advertising this protocol can serve as relay servers.
+const RELAY_HOP_PROTOCOL_FRAGMENT: &str = "circuit/relay";
+
+/// Bounded cache of message IDs that have already been forwarded.
+///
+/// Prevents infinite forwarding loops in multi-relay topologies.
+/// When a public node receives a message to forward, it checks
+/// this cache first.  If the message ID is already present, the
+/// message is silently dropped (another relay already handled it
+/// or we already forwarded it).
+///
+/// Uses FIFO eviction — oldest entries are removed when capacity
+/// is reached.
+struct ForwardCache {
+    /// Insertion-ordered queue for FIFO eviction.
+    order: VecDeque<[u8; 32]>,
+    /// Fast membership lookup.
+    set: HashSet<[u8; 32]>,
+    /// Maximum number of entries.
+    capacity: usize,
+}
+
+impl ForwardCache {
+    /// Creates a new cache with the given capacity.
+    fn new(capacity: usize) -> Self {
+        Self {
+            order: VecDeque::with_capacity(capacity.min(1024)),
+            set: HashSet::with_capacity(capacity.min(1024)),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Inserts a message ID into the cache.
+    ///
+    /// Returns `true` if the ID was **newly inserted** (not seen
+    /// before).  Returns `false` if the ID was already in the
+    /// cache (duplicate — should be skipped).
+    fn insert(&mut self, msg_id: [u8; 32]) -> bool {
+        if self.set.contains(&msg_id) {
+            return false;
+        }
+
+        // Evict oldest if at capacity.
+        if self.order.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+
+        self.set.insert(msg_id);
+        self.order.push_back(msg_id);
+        true
+    }
+
+    /// Returns the number of entries in the cache.
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
+impl Default for ForwardCache {
+    fn default() -> Self {
+        Self::new(FORWARD_CACHE_CAPACITY)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IdentifyResult — output from handle_identify_event
+// ---------------------------------------------------------------------------
+
+/// Information extracted from an Identify handshake.
+///
+/// Returned by [`handle_identify_event`] so the caller can
+/// trigger mailbox flush and auto-relay registration.
+struct IdentifyResult {
+    /// The Bitevachat address resolved from the peer's public key.
+    address: Address,
+    /// The peer's libp2p PeerId.
+    peer_id: PeerId,
+    /// Whether the peer advertises relay hop protocol support.
+    supports_relay: bool,
+    /// Public listen addresses extracted from the Identify info.
+    /// Only contains addresses with routable (non-private) IPs.
+    public_listen_addrs: Vec<Multiaddr>,
+}
+
+// ---------------------------------------------------------------------------
 // Combined behaviour
 // ---------------------------------------------------------------------------
 
@@ -109,6 +204,8 @@ pub struct BitevachatSwarm {
     relay_reservations_active: bool,
     /// Store-and-forward mailbox for messages to offline recipients.
     mailbox: Mailbox,
+    /// Dedup cache for cross-relay forwarded messages.
+    forward_cache: ForwardCache,
 }
 
 impl BitevachatSwarm {
@@ -188,6 +285,7 @@ impl BitevachatSwarm {
             nat_manager: NatManager::new(),
             relay_reservations_active: false,
             mailbox,
+            forward_cache: ForwardCache::default(),
         };
 
         Ok((me, event_rx))
@@ -588,20 +686,52 @@ impl BitevachatSwarm {
     }
 
     // -----------------------------------------------------------------------
-    // Application-level forwarding (with mailbox fallback)
+    // Application-level forwarding (with mailbox + cross-relay)
     // -----------------------------------------------------------------------
 
     /// Forwards a message to its intended recipient.
     ///
-    /// If the recipient is currently connected, the message is sent
-    /// immediately via `request_response`. If the recipient is NOT
-    /// connected, the message is stored in the [`Mailbox`] for
-    /// automatic delivery when the recipient connects.
-    fn forward_message(&mut self, wire: WireMessage, recipient: &Address) {
+    /// # Delivery strategy (ordered)
+    ///
+    /// 1. **Direct** — if the recipient is connected to this node,
+    ///    deliver immediately.
+    /// 2. **Mailbox** — store for delivery when recipient connects.
+    /// 3. **Cross-relay** — forward to other connected relay/public
+    ///    nodes that might have the recipient connected.
+    ///
+    /// # Deduplication
+    ///
+    /// Uses [`ForwardCache`] keyed by message ID.  If a message has
+    /// already been forwarded by this node, it is silently dropped.
+    /// This prevents infinite forwarding loops in multi-relay
+    /// topologies.
+    ///
+    /// # Parameters
+    ///
+    /// - `wire` — the original wire message to forward.
+    /// - `recipient` — the intended recipient address.
+    /// - `source_peer` — the peer that sent us this message.  Used
+    ///   to avoid forwarding back to the sender.
+    fn forward_message(
+        &mut self,
+        wire: WireMessage,
+        recipient: &Address,
+        source_peer: PeerId,
+    ) {
         let recipient_bytes = *recipient.as_bytes();
         let msg_id = wire.envelope.message.message_id;
+        let msg_id_bytes = *msg_id.as_bytes();
 
-        // Try direct forward first.
+        // Dedup: skip if already forwarded by this node.
+        if !self.forward_cache.insert(msg_id_bytes) {
+            tracing::debug!(
+                %msg_id,
+                "forward_message: message already in forward cache, skipping"
+            );
+            return;
+        }
+
+        // Strategy 1: Direct delivery to recipient.
         if let Some(peer_id) = self.resolve_address(recipient) {
             if self.swarm.is_connected(&peer_id) {
                 let _request_id = self
@@ -620,24 +750,74 @@ impl BitevachatSwarm {
             }
         }
 
-        // Recipient not connected — store in mailbox.
-        let stored = self.mailbox.store(&recipient_bytes, wire);
+        // Strategy 2: Store in mailbox for later delivery.
+        let stored = self.mailbox.store(&recipient_bytes, wire.clone());
         if stored {
             let pending = self.mailbox.pending_count_for(&recipient_bytes);
             tracing::info!(
                 %msg_id,
                 recipient = %recipient,
                 pending_in_mailbox = pending,
-                "recipient offline -- message stored in mailbox for later delivery"
+                "recipient offline -- stored in mailbox"
             );
         } else {
             tracing::warn!(
                 %msg_id,
                 recipient = %recipient,
-                "recipient offline -- mailbox full, message dropped \
-                 (sender's pending queue will retry)"
+                "mailbox full -- message not stored"
             );
         }
+
+        // Strategy 3: Cross-relay forwarding.
+        //
+        // Forward to other connected relay/public nodes. They will
+        // either deliver directly (if recipient is connected to
+        // them) or store in their own mailbox.
+        //
+        // We skip:
+        // - source_peer (don't bounce back)
+        // - ourselves (local_peer_id)
+        // - peers that are the recipient themselves (handled above)
+        let local = *self.swarm.local_peer_id();
+        let recipient_peer = self.resolve_address(recipient);
+
+        let relay_targets: Vec<PeerId> = self
+            .relay_nodes
+            .iter()
+            .map(|(pid, _)| *pid)
+            .filter(|pid| {
+                *pid != source_peer
+                    && *pid != local
+                    && Some(*pid) != recipient_peer
+                    && self.swarm.is_connected(pid)
+            })
+            .collect();
+
+        if relay_targets.is_empty() {
+            tracing::debug!(
+                %msg_id,
+                "no other relay nodes available for cross-relay forward"
+            );
+            return;
+        }
+
+        let mut forwarded_count = 0usize;
+        for relay_pid in &relay_targets {
+            let _request_id = self
+                .swarm
+                .behaviour_mut()
+                .messaging
+                .send_request(relay_pid, wire.clone());
+
+            forwarded_count = forwarded_count.saturating_add(1);
+        }
+
+        tracing::info!(
+            %msg_id,
+            recipient = %recipient,
+            relay_count = forwarded_count,
+            "cross-relay: forwarded to other public nodes"
+        );
     }
 
     /// Flushes all mailbox messages for a recipient that just connected.
@@ -704,7 +884,7 @@ impl BitevachatSwarm {
     }
 
     // -----------------------------------------------------------------------
-    // Mailbox management (public API for maintenance)
+    // Mailbox & forward cache management (public API for maintenance)
     // -----------------------------------------------------------------------
 
     /// Purges expired messages from the mailbox.
@@ -718,6 +898,85 @@ impl BitevachatSwarm {
     /// Returns mailbox statistics for monitoring.
     pub fn mailbox_stats(&self) -> MailboxStats {
         self.mailbox.stats()
+    }
+
+    /// Returns the number of entries in the forward dedup cache.
+    pub fn forward_cache_len(&self) -> usize {
+        self.forward_cache.len()
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-relay discovery
+    // -----------------------------------------------------------------------
+
+    /// Automatically registers a peer as a relay node if it supports
+    /// the relay hop protocol and has a public IP address.
+    ///
+    /// Called after each Identify handshake completes.  If the peer
+    /// qualifies, it is added to `relay_nodes` and a relay listen
+    /// is attempted on its circuit.
+    ///
+    /// This allows the network to dynamically discover new relay
+    /// nodes without hardcoding them in the config.
+    fn auto_register_relay(
+        &mut self,
+        peer_id: PeerId,
+        supports_relay: bool,
+        public_addrs: &[Multiaddr],
+    ) {
+        if !supports_relay || public_addrs.is_empty() {
+            return;
+        }
+
+        let local = *self.swarm.local_peer_id();
+        if peer_id == local {
+            return;
+        }
+
+        // Already registered?
+        if self.relay_nodes.iter().any(|(p, _)| *p == peer_id) {
+            return;
+        }
+
+        // Pick the first public address.
+        let relay_addr = &public_addrs[0];
+
+        // Strip /p2p/ component if present (we store clean addrs).
+        let clean_addr = strip_p2p_component(relay_addr);
+
+        self.relay_nodes.push((peer_id, clean_addr.clone()));
+        tracing::info!(
+            %peer_id,
+            addr = %clean_addr,
+            "auto-relay: discovered new relay node via Identify"
+        );
+
+        // Attempt to listen on the relay circuit.
+        match relay_helpers::build_relay_listen_addr(&clean_addr, &peer_id) {
+            Ok(circuit_listen) => {
+                match self.swarm.listen_on(circuit_listen.clone()) {
+                    Ok(listener_id) => {
+                        self.relay_reservations_active = true;
+                        tracing::info!(
+                            %peer_id,
+                            addr = %circuit_listen,
+                            ?listener_id,
+                            "auto-relay: listening on discovered relay circuit"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            %peer_id,
+                            %e,
+                            "auto-relay: listen failed (will retry in maintenance)"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%peer_id, %e, "auto-relay: failed to build listen addr");
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -839,10 +1098,17 @@ impl BitevachatSwarm {
                     &self.event_sender,
                 );
 
-                // When a peer's address is resolved via Identify,
-                // flush any mailbox messages waiting for that peer.
-                if let Some((address, peer_id)) = resolved {
-                    self.flush_mailbox_for_peer(&address, &peer_id);
+                // When a peer's address is resolved via Identify:
+                // 1. Flush any mailbox messages waiting for that peer.
+                // 2. Auto-register as relay if it qualifies.
+                if let Some(result) = resolved {
+                    self.flush_mailbox_for_peer(&result.address, &result.peer_id);
+
+                    self.auto_register_relay(
+                        result.peer_id,
+                        result.supports_relay,
+                        &result.public_listen_addrs,
+                    );
                 }
             }
             BitevachatBehaviourEvent::Messaging(msg_event) => {
@@ -980,9 +1246,10 @@ impl BitevachatSwarm {
                                 tracing::warn!(%peer, "failed to send relay ACK");
                             }
 
-                            // forward_message now stores to mailbox if
-                            // the recipient is not connected.
-                            self.forward_message(wire, &recipient);
+                            // forward_message stores to mailbox if
+                            // the recipient is not connected, and
+                            // cross-forwards to other relay nodes.
+                            self.forward_message(wire, &recipient, peer);
                         }
                         Err(ack) => {
                             tracing::warn!(
@@ -1081,13 +1348,13 @@ impl BitevachatSwarm {
 // Discovery event handlers
 // ---------------------------------------------------------------------------
 
-/// Handles a discovery event and returns the resolved address+peer
-/// if an Identify handshake completed.
+/// Handles a discovery event and returns an [`IdentifyResult`] if
+/// an Identify handshake completed.
 fn handle_discovery_event(
     event: DiscoveryBehaviourEvent,
     address_book: &mut HashMap<[u8; 32], PeerId>,
     event_sender: &mpsc::UnboundedSender<NetworkEvent>,
-) -> Option<(Address, PeerId)> {
+) -> Option<IdentifyResult> {
     match event {
         DiscoveryBehaviourEvent::Kademlia(kad_event) => {
             handle_kademlia_event(kad_event);
@@ -1162,14 +1429,14 @@ fn handle_kademlia_event(event: kad::Event) {
 
 /// Handles an Identify event.
 ///
-/// Returns `Some((address, peer_id))` when a peer's Bitevachat
-/// address was resolved, `None` otherwise. The caller uses this
-/// to flush the mailbox for the newly-resolved address.
+/// Returns an [`IdentifyResult`] when a peer's Bitevachat address
+/// was resolved.  The result includes relay capability and public
+/// listen addresses for auto-relay discovery.
 fn handle_identify_event(
     event: identify::Event,
     address_book: &mut HashMap<[u8; 32], PeerId>,
     event_sender: &mpsc::UnboundedSender<NetworkEvent>,
-) -> Option<(Address, PeerId)> {
+) -> Option<IdentifyResult> {
     match event {
         identify::Event::Received { peer_id, info, .. } => {
             tracing::info!(
@@ -1177,8 +1444,34 @@ fn handle_identify_event(
                 protocol_version = %info.protocol_version,
                 agent_version = %info.agent_version,
                 listen_addrs = ?info.listen_addrs,
+                protocols = ?info.protocols,
                 "identify: received peer info"
             );
+
+            // Detect relay hop protocol support.
+            let supports_relay = info
+                .protocols
+                .iter()
+                .any(|p| {
+                    let s = p.to_string();
+                    s.contains(RELAY_HOP_PROTOCOL_FRAGMENT)
+                });
+
+            // Extract public listen addresses.
+            let public_listen_addrs: Vec<Multiaddr> = info
+                .listen_addrs
+                .iter()
+                .filter(|addr| addr_has_public_ip(addr))
+                .cloned()
+                .collect();
+
+            if supports_relay {
+                tracing::info!(
+                    %peer_id,
+                    public_addrs = public_listen_addrs.len(),
+                    "identify: peer supports relay hop protocol"
+                );
+            }
 
             if let Ok(ed_pk) = info.public_key.try_into_ed25519() {
                 let raw_bytes = ed_pk.to_bytes();
@@ -1195,7 +1488,12 @@ fn handle_identify_event(
                     peer_id,
                 });
 
-                return Some((address, peer_id));
+                return Some(IdentifyResult {
+                    address,
+                    peer_id,
+                    supports_relay,
+                    public_listen_addrs,
+                });
             }
 
             None
@@ -1239,6 +1537,83 @@ fn extract_peer_id_and_addr(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
     }
 
     peer_id.map(|pid| (pid, clean_addr))
+}
+
+/// Strips the `/p2p/<peer_id>` component from a multiaddr.
+fn strip_p2p_component(addr: &Multiaddr) -> Multiaddr {
+    let mut clean = Multiaddr::empty();
+    for proto in addr.iter() {
+        if !matches!(proto, libp2p::multiaddr::Protocol::P2p(_)) {
+            clean.push(proto);
+        }
+    }
+    clean
+}
+
+/// Returns `true` if the multiaddr contains a routable (public) IP.
+///
+/// Checks for IPv4 and IPv6 addresses that are NOT:
+/// - Loopback (127.x.x.x / ::1)
+/// - Private (10.x, 172.16-31.x, 192.168.x)
+/// - Link-local (169.254.x.x / fe80::)
+/// - Unspecified (0.0.0.0 / ::)
+///
+/// Also returns `false` for p2p-circuit addresses (relay addrs).
+fn addr_has_public_ip(addr: &Multiaddr) -> bool {
+    // Skip relay circuit addresses.
+    let addr_str = addr.to_string();
+    if addr_str.contains("p2p-circuit") {
+        return false;
+    }
+
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::Ip4(ip) => {
+                if is_public_ipv4(ip) {
+                    return true;
+                }
+            }
+            libp2p::multiaddr::Protocol::Ip6(ip) => {
+                if is_public_ipv6(ip) {
+                    return true;
+                }
+            }
+            libp2p::multiaddr::Protocol::Dns4(_)
+            | libp2p::multiaddr::Protocol::Dns6(_)
+            | libp2p::multiaddr::Protocol::Dns(_) => {
+                // DNS names are assumed to be publicly routable.
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
+/// Returns `true` if the IPv4 address is publicly routable.
+fn is_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_private()
+        && !ip.is_link_local()
+        && !ip.is_unspecified()
+        && !ip.is_broadcast()
+        // Shared address space (100.64.0.0/10 — carrier-grade NAT).
+        && !(ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64)
+        // Documentation ranges.
+        && !(ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 2)
+        && !(ip.octets()[0] == 198 && ip.octets()[1] == 51 && ip.octets()[2] == 100)
+        && !(ip.octets()[0] == 203 && ip.octets()[1] == 0 && ip.octets()[2] == 113)
+}
+
+/// Returns `true` if the IPv6 address is publicly routable.
+fn is_public_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        // Link-local (fe80::/10).
+        && (ip.segments()[0] & 0xffc0) != 0xfe80
+        // Unique local (fc00::/7).
+        && (ip.segments()[0] & 0xfe00) != 0xfc00
 }
 
 // ---------------------------------------------------------------------------
