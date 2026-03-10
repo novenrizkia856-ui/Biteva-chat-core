@@ -165,36 +165,98 @@ impl BitevachatApp {
 
             UiEvent::MessageSent { message_id } => {
                 self.chat.last_sent_id = Some(message_id);
-                self.chat.scroll_to_bottom = true;
-                // Fetch updated message list.
-                self.request_messages();
+                // Don't scroll or re-fetch here — the optimistic
+                // message is already visible.  The next poll will
+                // bring the server-confirmed version.
             }
 
-            UiEvent::Messages(mut msgs) => {
+            UiEvent::Messages(msgs) => {
                 // Clear in-flight flag so next poll can request again.
                 self.messages_request_pending = false;
 
-                // Clear switching flag -- fresh messages have arrived.
+                // Clear switching flag — fresh messages have arrived.
                 self.chat.switching_convo = false;
 
-                // Sort by timestamp (ISO 8601 strings sort correctly
-                // in lexicographic order).  This ensures chronological
-                // display regardless of DB insertion order — critical
-                // for messages arriving via mailbox/relay with delay.
-                msgs.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+                // DO NOT sort by timestamp.  The server returns
+                // messages in DB insertion order (= receive order),
+                // which is the correct display order for a chat app.
+                // Sorting by original timestamp would move relay-
+                // delayed messages above locally-sent ones.
 
-                // Only update messages if content actually changed.
-                // This prevents flicker from identical poll responses.
-                if !messages_equal(&self.chat.messages, &msgs) {
-                    let had_fewer = msgs.len() > self.chat.messages.len();
-                    self.chat.messages = msgs;
+                // Build a set of server message IDs for fast lookup.
+                let server_ids: std::collections::HashSet<&str> = msgs
+                    .iter()
+                    .map(|m| m.message_id.as_str())
+                    .collect();
 
-                    // Only auto-scroll when NEW messages arrive,
-                    // not on every identical poll response.
+                // Keep optimistic messages that the server hasn't
+                // confirmed yet (their IDs start with "optimistic_").
+                // Remove optimistic messages whose content is now in
+                // the server list (matched by sender + approximate
+                // payload, since the real message_id differs).
+                let pending_optimistic: Vec<rpc_bridge::MessageItem> = self
+                    .chat
+                    .messages
+                    .iter()
+                    .filter(|m| {
+                        if !m.message_id.starts_with("optimistic_") {
+                            return false;
+                        }
+                        // Check if server already has a message with
+                        // matching sender + payload (= confirmed).
+                        let confirmed = msgs.iter().any(|sm| {
+                            sm.sender == m.sender
+                                && sm.payload_ciphertext == m.payload_ciphertext
+                        });
+                        // Keep only unconfirmed optimistic messages.
+                        !confirmed
+                    })
+                    .cloned()
+                    .collect();
+
+                // Compare server list with our current non-optimistic
+                // messages to detect actual changes.
+                let current_real: Vec<&str> = self
+                    .chat
+                    .messages
+                    .iter()
+                    .filter(|m| !m.message_id.starts_with("optimistic_"))
+                    .map(|m| m.message_id.as_str())
+                    .collect();
+
+                let server_list: Vec<&str> = msgs
+                    .iter()
+                    .map(|m| m.message_id.as_str())
+                    .collect();
+
+                let content_changed = current_real != server_list;
+
+                if content_changed {
+                    let had_fewer = msgs.len() > current_real.len();
+
+                    // Replace with server messages + any pending
+                    // optimistic messages at the end.
+                    let mut final_msgs = msgs;
+                    final_msgs.extend(pending_optimistic);
+                    self.chat.messages = final_msgs;
+
+                    // Auto-scroll only when NEW messages arrive.
                     if had_fewer {
                         self.chat.scroll_to_bottom = true;
                     }
+                } else if !pending_optimistic.is_empty() {
+                    // Server list unchanged, but we may need to
+                    // remove confirmed optimistic messages.
+                    let old_count = self.chat.messages.len();
+                    self.chat.messages.retain(|m| {
+                        !m.message_id.starts_with("optimistic_")
+                    });
+                    self.chat.messages.extend(pending_optimistic);
+
+                    // No scroll reset — content is visually the same.
+                    let _ = old_count; // suppress unused warning
                 }
+                // If nothing changed, do nothing (no flicker).
             }
 
             // ----- IMMEDIATE: single contact added -----
@@ -432,25 +494,6 @@ impl BitevachatApp {
             self.current_view = View::Chat;
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Message equality check (avoids unnecessary re-renders)
-// ---------------------------------------------------------------------------
-
-/// Compares two message lists by message_id to detect actual changes.
-/// Much cheaper than deep comparison and prevents flicker from
-/// identical poll responses.
-fn messages_equal(
-    a: &[rpc_bridge::MessageItem],
-    b: &[rpc_bridge::MessageItem],
-) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter()
-        .zip(b.iter())
-        .all(|(x, y)| x.message_id == y.message_id)
 }
 
 // ---------------------------------------------------------------------------

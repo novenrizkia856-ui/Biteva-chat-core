@@ -72,6 +72,8 @@ pub async fn handle_incoming_message(
     spam_filter: &SpamFilter,
     storage: &StorageEngine,
     event_tx: &mpsc::Sender<NodeEvent>,
+    wallet: Option<&bitevachat_wallet::wallet::Wallet>,
+    sender_pubkey: Option<&[u8; 32]>,
 ) -> BResult<()> {
     let sender = &envelope.message.sender;
     let recipient = &envelope.message.recipient;
@@ -157,12 +159,36 @@ pub async fn handle_incoming_message(
     // 2. Compute conversation ID.
     let convo_id = compute_convo_id(sender, recipient);
 
-    // 3. Store to message database.
-    store_envelope(storage, &convo_id, envelope)?;
+    // 3. Attempt E2E decryption if payload has magic header.
+    //
+    //    If the payload starts with [0xE2, 0xE0], it was encrypted
+    //    by the sender using our Ed25519 public key (converted to
+    //    X25519). We decrypt it here so the DB always stores plaintext.
+    //
+    //    If decryption fails (wrong key, corrupted, or we don't have
+    //    the wallet), we store the raw bytes as-is. The GUI will show
+    //    "[encrypted: N bytes]" for unreadable payloads.
+    let decrypted_payload = try_decrypt_e2e(
+        &envelope.message.payload_ciphertext,
+        sender_pubkey,
+        wallet,
+    );
 
+    // 4. Store to message database (plaintext if decrypted, raw otherwise).
+    store_envelope_with_payload(
+        storage,
+        &convo_id,
+        envelope,
+        &decrypted_payload,
+    )?;
+
+    let is_e2e = crate::outgoing::is_e2e_encrypted(
+        &envelope.message.payload_ciphertext,
+    );
     tracing::info!(
         %message_id,
         %sender,
+        e2e = is_e2e,
         "incoming message stored"
     );
 
@@ -215,14 +241,94 @@ pub fn compute_convo_id(a: &Address, b: &Address) -> ConvoId {
 }
 
 // ---------------------------------------------------------------------------
+// E2E decryption helper
+// ---------------------------------------------------------------------------
+
+/// Attempts to decrypt an E2E encrypted payload.
+///
+/// Returns the decrypted plaintext if successful, or the original
+/// payload bytes if:
+/// - The payload is not E2E encrypted (no magic header).
+/// - The wallet is not available (relay node forwarding).
+/// - Decryption fails (wrong key, corrupted).
+fn try_decrypt_e2e(
+    payload: &[u8],
+    sender_pubkey: Option<&[u8; 32]>,
+    wallet: Option<&bitevachat_wallet::wallet::Wallet>,
+) -> Vec<u8> {
+    // Not E2E encrypted → return as-is.
+    if !crate::outgoing::is_e2e_encrypted(payload) {
+        return payload.to_vec();
+    }
+
+    // No wallet available → return raw (relay nodes hit this path).
+    let wallet = match wallet {
+        Some(w) => w,
+        None => {
+            tracing::debug!("E2E payload detected but no wallet available for decryption");
+            return payload.to_vec();
+        }
+    };
+
+    // No sender pubkey → cannot derive HKDF context → cannot decrypt.
+    let spk = match sender_pubkey {
+        Some(pk) => pk,
+        None => {
+            tracing::debug!("E2E payload detected but no sender pubkey available for decryption");
+            return payload.to_vec();
+        }
+    };
+
+    // Parse the E2E binary format.
+    let encrypted = match crate::outgoing::parse_e2e_payload(payload) {
+        Ok(enc) => enc,
+        Err(e) => {
+            tracing::warn!(%e, "failed to parse E2E payload header");
+            return payload.to_vec();
+        }
+    };
+
+    // Get recipient keypair for decryption.
+    let keypair = match wallet.get_keypair() {
+        Ok(kp) => kp,
+        Err(e) => {
+            tracing::warn!(%e, "wallet locked, cannot decrypt E2E message");
+            return payload.to_vec();
+        }
+    };
+
+    match bitevachat_protocol::e2e::decrypt_message(&keypair, spk, &encrypted) {
+        Ok(plaintext) => {
+            tracing::info!(
+                plaintext_len = plaintext.len(),
+                "E2E message decrypted successfully"
+            );
+            plaintext
+        }
+        Err(e) => {
+            tracing::warn!(
+                %e,
+                "E2E decryption failed, storing raw payload"
+            );
+            payload.to_vec()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Storage helper
 // ---------------------------------------------------------------------------
 
-/// Stores a message envelope to the database.
-fn store_envelope(
+/// Stores a message envelope to the database with an overridden payload.
+///
+/// The `payload` parameter is used instead of `envelope.message.payload_ciphertext`.
+/// This allows storing decrypted plaintext while keeping the original
+/// envelope (with signature over ciphertext) intact.
+fn store_envelope_with_payload(
     storage: &StorageEngine,
     convo_id: &ConvoId,
     envelope: &MessageEnvelope,
+    payload: &[u8],
 ) -> BResult<()> {
     let msg_store = storage.messages()?;
 
@@ -239,7 +345,7 @@ fn store_envelope(
         convo_id: *convo_id.as_bytes(),
         timestamp_millis: envelope.message.timestamp.as_datetime().timestamp_millis(),
         payload_type: type_byte,
-        payload_ciphertext: envelope.message.payload_ciphertext.clone(),
+        payload_ciphertext: payload.to_vec(),
         nonce: *envelope.message.nonce.as_bytes(),
         signature: envelope.signature.as_bytes().to_vec(),
     };

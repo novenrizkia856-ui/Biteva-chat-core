@@ -108,6 +108,14 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
                     NetworkEvent::PeerAddressResolved { .. }
                 );
 
+                // Extract sender pubkey for E2E decryption (if this
+                // is a MessageReceived event).
+                let sender_pubkey = if let NetworkEvent::MessageReceived(ref env) = net_event {
+                    rt.network.lookup_pubkey(&env.message.sender)
+                } else {
+                    None
+                };
+
                 handle_network_event(
                     net_event,
                     &rt.spam_filter,
@@ -115,6 +123,8 @@ pub(crate) async fn run_event_loop(mut rt: NodeRuntime) {
                     &rt.storage,
                     &rt.pending_queue,
                     &rt.event_tx,
+                    &rt.wallet,
+                    sender_pubkey.as_ref(),
                 ).await;
 
                 if flush_pending {
@@ -235,6 +245,8 @@ async fn handle_network_event(
     storage: &bitevachat_storage::engine::StorageEngine,
     pending_queue: &std::sync::Arc<bitevachat_storage::pending::PendingQueue>,
     event_tx: &tokio::sync::mpsc::Sender<NodeEvent>,
+    wallet: &bitevachat_wallet::wallet::Wallet,
+    sender_pubkey: Option<&[u8; 32]>,
 ) {
     match event {
         NetworkEvent::MessageReceived(envelope) => {
@@ -244,6 +256,8 @@ async fn handle_network_event(
                 spam_filter,
                 storage,
                 event_tx,
+                Some(wallet),
+                sender_pubkey,
             ).await;
 
             if let Err(e) = result {
@@ -521,18 +535,33 @@ fn handle_send_message(
     recipient: bitevachat_types::Address,
     plaintext: &[u8],
     payload_type: bitevachat_types::PayloadType,
-    shared_key: &[u8; 32],
+    _shared_key: &[u8; 32],
 ) -> std::result::Result<MessageId, BitevachatError> {
+    // Lookup recipient's Ed25519 public key for E2E encryption.
+    // If not known (first message, peer never connected), falls
+    // back to plaintext. Subsequent messages will be encrypted
+    // after the recipient's pubkey is learned from their reply
+    // or Identify handshake.
+    let recipient_pubkey = rt.network.lookup_pubkey(&recipient);
+
+    if recipient_pubkey.is_some() {
+        tracing::debug!(%recipient, "E2E: recipient pubkey found, encrypting");
+    } else {
+        tracing::debug!(%recipient, "E2E: recipient pubkey unknown, sending plaintext");
+    }
+
     let (envelope, message_id) = outgoing::build_outgoing_envelope(
         &rt.wallet,
         recipient,
         plaintext,
         payload_type,
-        shared_key,
+        recipient_pubkey.as_ref(),
         rt.node_id,
     )?;
 
-    // 1. Store outgoing message locally.
+    // 1. Store outgoing message locally WITH PLAINTEXT.
+    //    The wire envelope has encrypted payload, but the local
+    //    copy stores plaintext for our own chat history.
     let sender_addr = bitevachat_crypto::signing::pubkey_to_address(
         &bitevachat_crypto::signing::PublicKey::from_bytes(*rt.wallet.public_key()),
     );

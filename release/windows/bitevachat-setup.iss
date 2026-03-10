@@ -18,7 +18,7 @@
 ; ==========================================================================
 
 #define MyAppName      "Bitevachat"
-#define MyAppVersion   "1.0"
+#define MyAppVersion   "1.1"
 #define MyAppPublisher "Biteva"
 #define MyAppURL       "https://bitevachat.net"
 #define MyAppExeName   "bitevachat-gui.exe"

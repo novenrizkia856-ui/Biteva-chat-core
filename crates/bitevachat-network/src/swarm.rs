@@ -163,6 +163,9 @@ struct IdentifyResult {
     address: Address,
     /// The peer's libp2p PeerId.
     peer_id: PeerId,
+    /// The peer's raw Ed25519 public key (32 bytes).
+    /// Used to populate the pubkey_book for E2E encryption.
+    ed25519_pubkey: [u8; 32],
     /// Whether the peer advertises relay hop protocol support.
     supports_relay: bool,
     /// Public listen addresses extracted from the Identify info.
@@ -206,6 +209,10 @@ pub struct BitevachatSwarm {
     mailbox: Mailbox,
     /// Dedup cache for cross-relay forwarded messages.
     forward_cache: ForwardCache,
+    /// Address → Ed25519 public key mapping.
+    /// Populated from WireMessage.sender_pubkey and Identify handshakes.
+    /// Used for E2E encryption (sender needs recipient's pubkey).
+    pubkey_book: HashMap<[u8; 32], [u8; 32]>,
 }
 
 impl BitevachatSwarm {
@@ -286,6 +293,7 @@ impl BitevachatSwarm {
             relay_reservations_active: false,
             mailbox,
             forward_cache: ForwardCache::default(),
+            pubkey_book: HashMap::new(),
         };
 
         Ok((me, event_rx))
@@ -458,6 +466,21 @@ impl BitevachatSwarm {
 
     pub fn sender_pubkey(&self) -> &[u8; 32] {
         &self.local_sender_pubkey
+    }
+
+    /// Looks up the Ed25519 public key for a Bitevachat address.
+    ///
+    /// Returns `Some` if the pubkey has been learned from a previous
+    /// WireMessage or Identify handshake, `None` otherwise.
+    pub fn lookup_pubkey(&self, address: &Address) -> Option<[u8; 32]> {
+        self.pubkey_book.get(address.as_bytes()).copied()
+    }
+
+    /// Registers an Ed25519 public key for an address.
+    ///
+    /// Called when a WireMessage or Identify reveals a peer's pubkey.
+    pub fn register_pubkey(&mut self, address_bytes: &[u8; 32], pubkey: [u8; 32]) {
+        self.pubkey_book.insert(*address_bytes, pubkey);
     }
 
     /// Attempts to deliver a message to the given recipient address.
@@ -1204,6 +1227,12 @@ impl BitevachatSwarm {
 
                     self.flush_mailbox_for_peer(&result.address, &result.peer_id);
 
+                    // Register Ed25519 pubkey for E2E encryption.
+                    self.pubkey_book.insert(
+                        *result.address.as_bytes(),
+                        result.ed25519_pubkey,
+                    );
+
                     self.auto_register_relay(
                         result.peer_id,
                         result.supports_relay,
@@ -1306,6 +1335,9 @@ impl BitevachatSwarm {
                 let wire: WireMessage = request;
                 let sender_bytes = *wire.envelope.message.sender.as_bytes();
                 self.address_book.insert(sender_bytes, peer);
+
+                // Record sender's Ed25519 pubkey for E2E encryption.
+                self.pubkey_book.insert(sender_bytes, wire.sender_pubkey);
 
                 let msg_recipient = &wire.envelope.message.recipient;
                 let is_for_us = msg_recipient.as_bytes() == self.local_address.as_bytes();
@@ -1591,6 +1623,7 @@ fn handle_identify_event(
                 return Some(IdentifyResult {
                     address,
                     peer_id,
+                    ed25519_pubkey: raw_bytes,
                     supports_relay,
                     public_listen_addrs,
                 });

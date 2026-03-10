@@ -674,10 +674,35 @@ fn render_input(
                 {
                     if let Some(ref recipient) = state.selected_convo {
                         let text = state.input_text.trim().to_string();
+
+                        // Send to backend.
                         let _ = cmd_tx.try_send(UiCommand::SendMessage {
                             recipient: recipient.clone(),
-                            text,
+                            text: text.clone(),
                         });
+
+                        // Optimistic: show message immediately in UI.
+                        // Uses a temporary ID that will be replaced
+                        // when the server confirms the message.
+                        if !state.my_address.is_empty() {
+                            let epoch_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis();
+                            let optimistic = MessageItem {
+                                message_id: format!(
+                                    "optimistic_{}",
+                                    epoch_ms,
+                                ),
+                                sender: state.my_address.clone(),
+                                recipient: recipient.clone(),
+                                timestamp: String::new(),
+                                payload_type: "Text".to_string(),
+                                payload_ciphertext: text.into_bytes(),
+                            };
+                            state.messages.push(optimistic);
+                        }
+
                         state.input_text.clear();
                         state.scroll_to_bottom = true;
                         resp.request_focus();
